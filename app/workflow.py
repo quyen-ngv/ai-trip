@@ -42,11 +42,14 @@ class JavaClient:
             
             response_json = r.json()
             
-            # Check if backend returned business error (meta.code != null means error)
-            if "meta" in response_json and response_json["meta"].get("code"):
-                error_msg = response_json["meta"].get("message", "Business error")
-                logger.error(f"Business error from backend: {error_msg}")
-                raise Exception(error_msg)
+            # Check if backend returned business error (meta.code exists and != 200000)
+            # Backend uses 200000 for SUCCESS, not 200
+            if "meta" in response_json:
+                code = response_json["meta"].get("code")
+                if code and code != 200000:
+                    error_msg = response_json["meta"].get("message", "Business error")
+                    logger.error(f"Business error from backend: code={code}, message={error_msg}")
+                    raise Exception(error_msg)
             
             # Success case: return data
             return response_json.get("data")
