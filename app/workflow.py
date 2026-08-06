@@ -97,7 +97,6 @@ def solve_schedule(places_with_time, days, day_offset, prefs):
     # Constraint 3: Non-overlapping intervals with travel time
     for d in range(days):
         intervals = []
-        day_places = []
         
         for i in range(len(places_with_time)):
             p = places_with_time[i]
@@ -112,33 +111,44 @@ def solve_schedule(places_with_time, days, day_offset, prefs):
                 f'interval_{i}_{d}'
             )
             intervals.append(interval)
-            day_places.append((i, p))
         
         # No overlap within day
         model.add_no_overlap(intervals)
         
-        # Add travel time between consecutive places in same day
-        # Sort by start time and add travel constraints
-        for idx1, (i1, p1) in enumerate(day_places):
-            for idx2, (i2, p2) in enumerate(day_places):
-                if idx1 >= idx2:
+        # Add minimum gap between activities for travel time
+        for i1 in range(len(places_with_time)):
+            for i2 in range(len(places_with_time)):
+                if i1 >= i2:
                     continue
                 
-                # If both places on same day and i2 comes after i1
-                both_selected = model.new_bool_var(f'both_{i1}_{i2}_{d}')
-                model.add(both_selected == 1).only_enforce_if([x[i1,d], x[i2,d]])
+                p1 = places_with_time[i1]
+                p2 = places_with_time[i2]
                 
-                # Calculate travel time
+                # Calculate travel time between places
                 km = haversine(p1, p2) if p1.get('latitude') and p2.get('latitude') else 0
                 if km < 1.5:
                     travel_minutes = max(10, int(km / WALKING_SPEED_KM_PER_HOUR * 60))
                 else:
                     travel_minutes = max(5, int(km / TAXI_SPEED_KM_PER_HOUR * 60))
                 
-                # If i2 after i1: start[i2] >= start[i1] + duration[i1] + travel
+                # If both selected in same day, enforce minimum gap
+                both_selected = model.new_bool_var(f'both_{i1}_{i2}_{d}')
+                model.add(both_selected == 1).only_enforce_if([x[i1,d], x[i2,d]])
+                
+                # If i2 starts after i1 ends, add travel time
                 duration1 = p1.get('visitDurationMinutes') or 90
-                follows = model.new_bool_var(f'follows_{i1}_{i2}_{d}')
-                model.add(start_time[i2] >= start_time[i1] + duration1 + travel_minutes).only_enforce_if([both_selected, follows])
+                i2_after_i1 = model.new_bool_var(f'i2_after_i1_{i1}_{i2}_{d}')
+                model.add(start_time[i2] >= start_time[i1] + duration1).only_enforce_if([both_selected, i2_after_i1])
+                model.add(start_time[i2] >= start_time[i1] + duration1 + travel_minutes).only_enforce_if([both_selected, i2_after_i1])
+                
+                # If i1 starts after i2 ends, add travel time
+                duration2 = p2.get('visitDurationMinutes') or 90
+                i1_after_i2 = model.new_bool_var(f'i1_after_i2_{i1}_{i2}_{d}')
+                model.add(start_time[i1] >= start_time[i2] + duration2).only_enforce_if([both_selected, i1_after_i2])
+                model.add(start_time[i1] >= start_time[i2] + duration2 + travel_minutes).only_enforce_if([both_selected, i1_after_i2])
+                
+                # One must be after the other if both selected
+                model.add(i2_after_i1 + i1_after_i2 >= 1).only_enforce_if(both_selected)
     
     # Constraint 4: Soft meal constraints (penalties instead of hard constraints)
     meal_penalties = []
@@ -431,30 +441,34 @@ Rules:
                 transport_start_minutes = last.get('startMinutes', 0) + (last.get('visitDurationMinutes') or 90)
                 transport_end_minutes = p.get('startMinutes', 0)
                 
-                transport_start_hour = transport_start_minutes // 60
-                transport_start_min = transport_start_minutes % 60
-                transport_end_hour = transport_end_minutes // 60
-                transport_end_min = transport_end_minutes % 60
-                
-                items.append({
-                    "type":"TRANSPORT",
-                    "name":f"Di chuyển đến {p.get('title', p.get('name',''))}",
-                    "dayNumber":day,
-                    "sortOrder":len(items),
-                    "startTime":f"{transport_start_hour:02d}:{transport_start_min:02d}:00",
-                    "endTime":f"{transport_end_hour:02d}:{transport_end_min:02d}:00",
-                    "address":last.get("address"),
-                    "latitude":last.get("latitude"),
-                    "longitude":last.get("longitude"),
-                    "endAddress":p.get("address"),
-                    "endLatitude":p.get("latitude"),
-                    "endLongitude":p.get("longitude"),
-                    "transportMode":mode,
-                    "durationValueToNext":mins*60,
-                    "durationToNext":f"{mins} phút",
-                    "distanceValueToNext":int(km*1000),
-                    "distanceToNext":f"{km:.1f} km"
-                })
+                # Validate: transport end must be after start
+                if transport_end_minutes > transport_start_minutes:
+                    transport_start_hour = transport_start_minutes // 60
+                    transport_start_min = transport_start_minutes % 60
+                    transport_end_hour = transport_end_minutes // 60
+                    transport_end_min = transport_end_minutes % 60
+                    
+                    items.append({
+                        "type":"TRANSPORT",
+                        "name":f"Di chuyển đến {p.get('title', p.get('name',''))}",
+                        "dayNumber":day,
+                        "sortOrder":len(items),
+                        "startTime":f"{transport_start_hour:02d}:{transport_start_min:02d}:00",
+                        "endTime":f"{transport_end_hour:02d}:{transport_end_min:02d}:00",
+                        "address":last.get("address"),
+                        "latitude":last.get("latitude"),
+                        "longitude":last.get("longitude"),
+                        "endAddress":p.get("address"),
+                        "endLatitude":p.get("latitude"),
+                        "endLongitude":p.get("longitude"),
+                        "transportMode":mode,
+                        "durationValueToNext":mins*60,
+                        "durationToNext":f"{mins} phút",
+                        "distanceValueToNext":int(km*1000),
+                        "distanceToNext":f"{km:.1f} km"
+                    })
+                else:
+                    logger.warning(f"Skipping transport: end ({transport_end_minutes}) <= start ({transport_start_minutes})")
             
             # Add place visit (times already set by solver)
             items.append({
