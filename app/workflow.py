@@ -1,11 +1,11 @@
 from __future__ import annotations
-import asyncio, math, re, logging
-from datetime import date, datetime, timedelta
+import asyncio, math, logging
+from datetime import date
 from typing import Any, TypedDict
 import httpx
 from langgraph.graph import StateGraph, START, END
-from ortools.sat.python import cp_model
 from .llm import CachedModel
+from .prompts import build_filter_prompt, build_enrichment_prompt, build_verify_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -54,212 +54,26 @@ class JavaClient:
             # Success case: return data
             return response_json.get("data")
 
-def tokens(text): return set(re.findall(r"[\wÀ-ỹ]+",(text or "").lower()))
 def haversine(a,b):
     p1,p2=math.radians(float(a["latitude"])),math.radians(float(b["latitude"]));dp=p2-p1;dl=math.radians(float(b["longitude"])-float(a["longitude"]));q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2;return 6371*2*math.atan2(math.sqrt(q),math.sqrt(1-q))
 
-def rank(place,prefs):
-    corpus=" ".join(str(place.get(k) or "") for k in ("title","address","category","menuHighlights","attributes","description"))
-    overlap=len(tokens(prefs)&tokens(corpus)); quality=float(place.get("score") or place.get("reviewRating") or 0); reviews=math.log1p(place.get("reviewCount") or 0)
-    return overlap*20+quality*2+reviews-float(place.get("distanceKm") or 0)*.05
-
 def destination_days(d): return (date.fromisoformat(d["endDate"])-date.fromisoformat(d["startDate"])).days+1
 
-def solve_schedule(places_with_time, days, day_offset, prefs):
-    """OR-Tools scheduling with duration, travel time, and pace constraints."""
-    if not places_with_time:
+def simple_schedule(places, days, day_offset):
+    """Simple scheduler: top places by score, distribute across days."""
+    if not places:
         return []
     
-    # Configuration
-    DAY_START_MINUTES = 8 * 60  # 8:00
-    DAY_END_MINUTES = 20 * 60    # 20:00
-    MAX_ACTIVITIES_PER_DAY = 5   # RELAXED pace
-    WALKING_SPEED_KM_PER_HOUR = 4.5
-    TAXI_SPEED_KM_PER_HOUR = 20
-    
-    model = cp_model.CpModel()
-    
-    # Decision variables
-    x = {}  # x[i,d] = place i assigned to day d
-    start_time = {}  # start_time[i] = start time in minutes from midnight
-    
-    for i in range(len(places_with_time)):
-        for d in range(days):
-            x[i,d] = model.new_bool_var(f'x_{i}_{d}')
-        # Start time domain: 8:00 to 19:00 (allow 1h activity until 20:00)
-        start_time[i] = model.new_int_var(DAY_START_MINUTES, DAY_END_MINUTES - 60, f'start_{i}')
-    
-    # Constraint 1: Each place used at most once
-    for i in range(len(places_with_time)):
-        model.add(sum(x[i,d] for d in range(days)) <= 1)
-    
-    # Constraint 2: Max activities per day (pace control)
-    for d in range(days):
-        model.add(sum(x[i,d] for i in range(len(places_with_time))) <= MAX_ACTIVITIES_PER_DAY)
-    
-    # Constraint 3: Non-overlapping intervals with travel time
-    for d in range(days):
-        intervals = []
-        
-        for i in range(len(places_with_time)):
-            p = places_with_time[i]
-            duration = p.get('visitDurationMinutes') or 90  # Default 90 if None
-            
-            # Create interval only if place assigned to this day
-            interval = model.new_optional_interval_var(
-                start_time[i],
-                duration,
-                start_time[i] + duration,
-                x[i,d],
-                f'interval_{i}_{d}'
-            )
-            intervals.append(interval)
-        
-        # No overlap within day
-        model.add_no_overlap(intervals)
-        
-        # Add minimum gap between activities for travel time
-        for i1 in range(len(places_with_time)):
-            for i2 in range(len(places_with_time)):
-                if i1 >= i2:
-                    continue
-                
-                p1 = places_with_time[i1]
-                p2 = places_with_time[i2]
-                
-                # Calculate travel time between places
-                km = haversine(p1, p2) if p1.get('latitude') and p2.get('latitude') else 0
-                if km < 1.5:
-                    travel_minutes = max(10, int(km / WALKING_SPEED_KM_PER_HOUR * 60))
-                else:
-                    travel_minutes = max(5, int(km / TAXI_SPEED_KM_PER_HOUR * 60))
-                
-                # If both selected in same day, enforce minimum gap
-                both_selected = model.new_bool_var(f'both_{i1}_{i2}_{d}')
-                model.add(both_selected == 1).only_enforce_if([x[i1,d], x[i2,d]])
-                
-                # If i2 starts after i1 ends, add travel time
-                duration1 = p1.get('visitDurationMinutes') or 90
-                i2_after_i1 = model.new_bool_var(f'i2_after_i1_{i1}_{i2}_{d}')
-                model.add(start_time[i2] >= start_time[i1] + duration1).only_enforce_if([both_selected, i2_after_i1])
-                model.add(start_time[i2] >= start_time[i1] + duration1 + travel_minutes).only_enforce_if([both_selected, i2_after_i1])
-                
-                # If i1 starts after i2 ends, add travel time
-                duration2 = p2.get('visitDurationMinutes') or 90
-                i1_after_i2 = model.new_bool_var(f'i1_after_i2_{i1}_{i2}_{d}')
-                model.add(start_time[i1] >= start_time[i2] + duration2).only_enforce_if([both_selected, i1_after_i2])
-                model.add(start_time[i1] >= start_time[i2] + duration2 + travel_minutes).only_enforce_if([both_selected, i1_after_i2])
-                
-                # One must be after the other if both selected
-                model.add(i2_after_i1 + i1_after_i2 >= 1).only_enforce_if(both_selected)
-    
-    # Constraint 4: Soft meal constraints (penalties instead of hard constraints)
-    meal_penalties = []
-    
-    for d in range(days):
-        breakfast_places = [i for i,p in enumerate(places_with_time) 
-                           if p.get('isFoodVenue') and p.get('mealType') in ['breakfast', 'snack']]
-        lunch_places = [i for i,p in enumerate(places_with_time) 
-                       if p.get('isFoodVenue') and p.get('mealType') in ['lunch', 'snack']]
-        dinner_places = [i for i,p in enumerate(places_with_time) 
-                        if p.get('isFoodVenue') and p.get('mealType') in ['dinner', 'snack']]
-        
-        # Breakfast missing penalty (lower priority)
-        if breakfast_places:
-            has_breakfast = model.new_bool_var(f'has_breakfast_{d}')
-            model.add(sum(x[i,d] for i in breakfast_places) >= 1).only_enforce_if(has_breakfast)
-            model.add(sum(x[i,d] for i in breakfast_places) == 0).only_enforce_if(has_breakfast.Not())
-            breakfast_penalty = model.new_int_var(0, 1000, f'breakfast_penalty_{d}')
-            model.add(breakfast_penalty == 0).only_enforce_if(has_breakfast)
-            model.add(breakfast_penalty == 10).only_enforce_if(has_breakfast.Not())
-            meal_penalties.append(breakfast_penalty)
-        
-        # Lunch missing penalty
-        if lunch_places:
-            has_lunch = model.new_bool_var(f'has_lunch_{d}')
-            model.add(sum(x[i,d] for i in lunch_places) >= 1).only_enforce_if(has_lunch)
-            model.add(sum(x[i,d] for i in lunch_places) == 0).only_enforce_if(has_lunch.Not())
-            lunch_penalty = model.new_int_var(0, 3000, f'lunch_penalty_{d}')
-            model.add(lunch_penalty == 0).only_enforce_if(has_lunch)
-            model.add(lunch_penalty == 30).only_enforce_if(has_lunch.Not())
-            meal_penalties.append(lunch_penalty)
-        
-        # Dinner missing penalty
-        if dinner_places:
-            has_dinner = model.new_bool_var(f'has_dinner_{d}')
-            model.add(sum(x[i,d] for i in dinner_places) >= 1).only_enforce_if(has_dinner)
-            model.add(sum(x[i,d] for i in dinner_places) == 0).only_enforce_if(has_dinner.Not())
-            dinner_penalty = model.new_int_var(0, 3000, f'dinner_penalty_{d}')
-            model.add(dinner_penalty == 0).only_enforce_if(has_dinner)
-            model.add(dinner_penalty == 30).only_enforce_if(has_dinner.Not())
-            meal_penalties.append(dinner_penalty)
-    
-    # Objective: maximize preference scores - meal penalties
-    score_sum = sum(
-        int(p.get('timeScore', 50) * 100) * x[i,d]
-        for i,p in enumerate(places_with_time)
-        for d in range(days)
-    )
-    total_penalty = sum(meal_penalties) if meal_penalties else 0
-    model.maximize(score_sum - total_penalty)
-    
-    # Solve
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 8
-    status = solver.solve(model)
-    
-    if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        logger.warning(f"Solver failed with status {status}, using fallback scheduler")
-        # Fallback: simple round-robin scheduler
-        return fallback_schedule(places_with_time, days, day_offset, prefs)
-    
-    # Extract solution
-    schedule = []
-    for d in range(days):
-        day_items = []
-        for i, p in enumerate(places_with_time):
-            if solver.value(x[i,d]):
-                place = p.copy()
-                place['dayNumber'] = day_offset + d + 1
-                place['startMinutes'] = solver.value(start_time[i])
-                
-                # Convert minutes to HH:MM
-                hour = place['startMinutes'] // 60
-                minute = place['startMinutes'] % 60
-                place['startTime'] = f"{hour:02d}:{minute:02d}:00"
-                
-                # Calculate end time
-                duration = p.get('visitDurationMinutes') or 90  # Default 90 if None
-                end_minutes = place['startMinutes'] + duration
-                end_hour = end_minutes // 60
-                end_minute = end_minutes % 60
-                place['endTime'] = f"{end_hour:02d}:{end_minute:02d}:00"
-                
-                day_items.append(place)
-        
-        # Sort by start time within day
-        day_items.sort(key=lambda x: x['startMinutes'])
-        schedule.extend(day_items)
-    
-    return schedule
-
-
-def fallback_schedule(places, days, day_offset, prefs):
-    """Simple fallback scheduler when OR-Tools fails."""
-    logger.info("Using fallback scheduler")
-    
-    # Take top places by score
     sorted_places = sorted(places, key=lambda p: p.get('timeScore', 0), reverse=True)
     target = min(days * 3, len(sorted_places))
     selected = sorted_places[:target]
     
-    # Distribute across days
     per_day = max(1, target // days)
     schedule = []
     
     for d in range(days):
         day_places = selected[d * per_day:(d + 1) * per_day]
-        current_time = 8 * 60  # Start at 8:00
+        current_time = 8 * 60
         
         for p in day_places:
             place = p.copy()
@@ -270,21 +84,19 @@ def fallback_schedule(places, days, day_offset, prefs):
             minute = current_time % 60
             place['startTime'] = f"{hour:02d}:{minute:02d}:00"
             
-            duration = p.get('visitDurationMinutes') or 90  # Default 90 if None
+            duration = p.get('visitDurationMinutes') or 90
             end_time = current_time + duration
             end_hour = end_time // 60
             end_minute = end_time % 60
             place['endTime'] = f"{end_hour:02d}:{end_minute:02d}:00"
             
             schedule.append(place)
-            
-            # Add gap for next activity (including travel)
-            current_time = end_time + 60  # 1 hour gap
+            current_time = end_time + 60
     
     return schedule
 
 async def build_workflow(job,token):
-    java=JavaClient(job,token);cheap=CachedModel("CHEAP_LLM");quality=CachedModel("QUALITY_LLM")
+    java=JavaClient(job,token);cheap=CachedModel("CHEAP_LLM");quality=CachedModel("CHEAP_LLM")  # Use CHEAP_LLM (flash) for both
     async def validate(s): await java.event("VALIDATING",5,"ai_trip.validating");return s
     async def retrieve(s):
         await java.event("RETRIEVING",15,"ai_trip.retrieving")
@@ -296,33 +108,47 @@ async def build_workflow(job,token):
         await java.event("FAST_FILTER",30,"ai_trip.fast_filter")
         prefs=job["request"].get("preferenceText",""); filtered=[]
         
+        # Build rich context prompt
+        preferences_dict = {
+            'placeGroups': job["request"].get("placeGroups", []),
+            'pace': job["request"].get("pace", "BALANCED"),
+            'groupComposition': job["request"].get("groupComposition", ""),
+            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
+            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
+            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
+            'activityTypes': job["request"].get("activityTypes", []),
+            'preferenceText': prefs,
+            'budgetMin': job["request"].get("budgetMin"),
+            'budgetMax': job["request"].get("budgetMax"),
+        }
+        
+        system_prompt = build_filter_prompt(preferences_dict)
+        
         for d,inv in zip(job["request"]["destinations"],s["inventories"]):
-            ordered=sorted(inv,key=lambda p:rank(p,prefs),reverse=True)
-            # Send compact fields for 120 places
+            # Send ALL places with minimal fields (just title + address)
             compact_places = [{
                 "id": p["id"], 
                 "name": p.get("name",""), 
                 "address": p.get("address",""),
-                "rating": p.get("rating",0), 
-                "types": p.get("types",[]),
-                "attributes": p.get("attributes", {})
-            } for p in ordered[:120]]
+            } for p in inv]
             
-            target_count = max(40, destination_days(d) * 8)  # More generous pool
+            target_count = max(40, destination_days(d) * 8)
             
             cheap_result=await cheap.json(
-                f"Choose top {target_count} most relevant place ids IN ORDER from the input based on preferences. Never invent ids. Return JSON with format: {{\"ids\":[\"id1\",\"id2\",...]}}",
-                {"preferences":prefs,"places":compact_places,"count":target_count},
+                system_prompt + f"\n\nReturn JSON: {{\"ids\":[\"id1\",\"id2\",...]}}\nSelect top {target_count} most relevant place IDs in priority order.",
+                {"places":compact_places,"targetCount":target_count},
                 max_tokens=2048
             )
             
-            # Preserve LLM ordering if available
+            # Preserve LLM ordering
             if cheap_result and cheap_result.get("ids"):
                 id_set = set(str(x) for x in cheap_result["ids"])
-                selected = [p for p in ordered if str(p["id"]) in id_set]
+                id_to_place = {str(p["id"]): p for p in inv}
+                selected = [id_to_place[pid] for pid in cheap_result["ids"] if pid in id_to_place]
                 filtered.append(selected[:target_count])
             else:
-                filtered.append(ordered[:target_count])
+                # Fallback: top by rating
+                filtered.append(sorted(inv, key=lambda p: p.get("rating", 0), reverse=True)[:target_count])
         
         return {"filtered":filtered}
     
@@ -332,83 +158,136 @@ async def build_workflow(job,token):
         prefs=job["request"].get("preferenceText","")
         enriched=[]
         
+        # Build rich context prompt
+        preferences_dict = {
+            'placeGroups': job["request"].get("placeGroups", []),
+            'pace': job["request"].get("pace", "BALANCED"),
+            'groupComposition': job["request"].get("groupComposition", ""),
+            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
+            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
+            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
+            'activityTypes': job["request"].get("activityTypes", []),
+            'preferenceText': prefs,
+            'budgetMin': job["request"].get("budgetMin"),
+            'budgetMax': job["request"].get("budgetMax"),
+        }
+        
+        system_prompt = build_enrichment_prompt(preferences_dict)
+        
         for d,places in zip(job["request"]["destinations"],s["filtered"]):
-            # Send full details including opening hours for deep analysis
-            full_places = [{
-                "id": p["id"],
-                "name": p.get("name",""),
-                "address": p.get("address",""),
-                "rating": p.get("rating",0),
-                "types": p.get("types",[]),
-                "attributes": p.get("attributes",{}),
-                "description": p.get("description",""),
-                "about": p.get("about",""),
-                "category": p.get("category",""),
-                "priceLevel": p.get("priceLevel"),
-                "visitDurationMinutes": p.get("visitDurationMinutes"),
-                "openingHours": p.get("openingHours",""),
-                "weeklyOpeningHours": p.get("weeklyOpeningHours",[]),
-                "openPeriods": p.get("openPeriods",[])
-            } for p in places]
+            days = destination_days(d)
+            # Dynamic limit based on days: max 8 places per day
+            max_places = min(len(places), days * 8)
+            places_to_enrich = places[:max_places]
             
-            system_prompt = """Analyze each place and return JSON array with this EXACT format for each:
-{
-  "id": "original_id",
-  "isFoodVenue": true/false,
-  "mealType": "breakfast|lunch|dinner|snack|null",
-  "timeScore": 0-100 (higher=better fit for user preferences),
-  "visitDurationMinutes": estimated_minutes,
-  "dietaryTags": ["halal", "vegan", etc],
-  "openingHoursValid": true/false (false if no opening hours data)
-}
-
-Rules:
-- Never invent IDs, use exact input IDs
-- isFoodVenue=true for restaurants, cafes, food stalls
-- mealType based on ACTUAL opening hours from openingHours/weeklyOpeningHours/openPeriods data
-- If no opening hours data available, set openingHoursValid=false and guess conservatively
-- timeScore reflects how well place matches user preferences (NOT time-of-day preference)
-- visitDurationMinutes: food venues 60-90min, attractions 90-180min, theme parks 180-360min
-- Output JSON array with ALL input places"""
-
-            quality_result=await quality.json(
-                system_prompt,
-                {"preferences":prefs,"places":full_places},
-                max_tokens=8192
-            )
+            # Send only non-empty fields to reduce token usage
+            full_places = []
+            for p in places_to_enrich:
+                place = {"id": p["id"]}
+                
+                # Always include basic fields
+                if p.get("name"):
+                    place["name"] = p["name"]
+                if p.get("address"):
+                    place["address"] = p["address"]
+                if p.get("category"):
+                    place["category"] = p["category"]
+                
+                # Include numeric fields if meaningful
+                rating = p.get("rating", 0)
+                if rating and rating > 0:
+                    place["rating"] = rating
+                
+                review_count = p.get("reviewCount", 0)
+                if review_count and review_count > 0:
+                    place["reviewCount"] = review_count
+                
+                # Include arrays if not empty
+                types = p.get("types", [])
+                if types:
+                    place["types"] = types
+                
+                # Include attributes only if not empty, strip description & source_found
+                attrs = p.get("attributes", {})
+                if attrs:
+                    # Keep only 'value' field from each attribute to save tokens
+                    cleaned_attrs = {}
+                    for key, val in attrs.items():
+                        if isinstance(val, dict) and 'value' in val:
+                            cleaned_attrs[key] = val['value']
+                        elif not isinstance(val, dict):
+                            # Keep primitive values as-is
+                            cleaned_attrs[key] = val
+                    
+                    if cleaned_attrs:
+                        place["attributes"] = cleaned_attrs
+                
+                # Include description/openingHours only if present
+                desc = p.get("description", "")
+                if desc:
+                    place["description"] = desc
+                
+                opening = p.get("openingHours", "")
+                if opening:
+                    place["openingHours"] = opening
+                
+                # Include optional fields only if present
+                if p.get("priceLevel"):
+                    place["priceLevel"] = p["priceLevel"]
+                
+                if p.get("visitDurationMinutes"):
+                    place["visitDurationMinutes"] = p["visitDurationMinutes"]
+                
+                full_places.append(place)
+            
+            # Retry logic for LLM call
+            quality_result = None
+            for attempt in range(3):
+                quality_result = await quality.json(
+                    system_prompt + "\n\nReturn JSON array with EXACT format specified in guidelines. Include ALL input places.",
+                    {"places":full_places},
+                    max_tokens=32768  # Max tokens for DeepSeek v4
+                )
+                
+                if quality_result and isinstance(quality_result, list):
+                    break
+                    
+                logger.warning(f"Deep select attempt {attempt+1}/3 failed: got {type(quality_result)}")
+                if attempt < 2:
+                    await asyncio.sleep(2)  # Wait before retry
+            
+            logger.info(f"Deep select for destination {d.get('name', 'unknown')}: sent {len(full_places)} places")
+            logger.info(f"Result type: {type(quality_result)}")
+            logger.info(f"Full result: {quality_result}")
             
             if quality_result and isinstance(quality_result, list):
+                logger.info(f"Successfully enriched {len(quality_result)} places")
                 # Merge enrichment back to original places
                 enrich_map = {str(e["id"]): e for e in quality_result if "id" in e}
-                for p in places:
+                for p in places_to_enrich:
                     if str(p["id"]) in enrich_map:
                         p.update(enrich_map[str(p["id"])])
-                enriched.append(places)
+                enriched.append(places_to_enrich)
             else:
-                # Fallback: use original places with default values
-                logger.warning("Deep select LLM failed, using defaults")
-                for p in places:
-                    types_str = str(p.get("types",[])).lower()
-                    category_str = str(p.get("category","")).lower()
-                    p.setdefault("isFoodVenue", "restaurant" in types_str or "food" in category_str or "cafe" in types_str)
-                    p.setdefault("mealType", None)
-                    p.setdefault("timeScore", 50)
-                    p.setdefault("openingHoursValid", False)
-                enriched.append(places)
+                # LLM failed after 3 retries - ABORT
+                error_msg = f"AI enrichment failed after 3 retries - got {type(quality_result).__name__} instead of list"
+                logger.error(error_msg)
+                logger.error(f"Full quality_result: {quality_result}")
+                raise Exception(error_msg)
         
         return {"enriched":enriched}
     
     async def select(s):
-        """Select: OR-Tools scheduling with meal & time constraints."""
+        """Select: simple scheduling by timeScore."""
         await java.event("SCHEDULING",65,"ai_trip.scheduling")
         selected=[]
         day_offset = 0
         
         for d,places in zip(job["request"]["destinations"],s["enriched"]):
             days = destination_days(d)
-            scheduled = solve_schedule(places, days, day_offset, job["request"].get("preferenceText",""))
+            scheduled = simple_schedule(places, days, day_offset)
             selected.append(scheduled)
-            day_offset += days  # Increment for next destination
+            day_offset += days
         
         return {"selected":selected}
     async def schedule(s):
@@ -542,22 +421,71 @@ Rules:
             if item["type"] == "PLACE_VISIT" and item.get("placeId"):
                 place = place_map.get(item["placeId"])
                 if place:
-                    enriched["placeDetails"] = {
-                        "description": place.get("description", ""),
-                        "about": place.get("about", ""),
-                        "attributes": place.get("attributes", {}),
-                        "category": place.get("category", ""),
-                        "rating": place.get("rating", 0)
-                    }
+                    # Only include non-empty placeDetails fields
+                    details = {}
+                    
+                    if place.get("description"):
+                        details["description"] = place["description"]
+                    
+                    if place.get("about"):
+                        details["about"] = place["about"]
+                    
+                    attrs = place.get("attributes", {})
+                    if attrs:
+                        details["attributes"] = attrs
+                    
+                    if place.get("category"):
+                        details["category"] = place["category"]
+                    
+                    rating = place.get("rating", 0)
+                    if rating and rating > 0:
+                        details["rating"] = rating
+                    
+                    # Only add placeDetails if there's actual data
+                    if details:
+                        enriched["placeDetails"] = details
+            
             enriched_items.append(enriched)
         
+        # Build full preferences context
+        preferences_dict = {
+            'placeGroups': job["request"].get("placeGroups", []),
+            'pace': job["request"].get("pace", "BALANCED"),
+            'groupComposition': job["request"].get("groupComposition", ""),
+            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
+            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
+            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
+            'activityTypes': job["request"].get("activityTypes", []),
+            'preferenceText': job["request"].get("preferenceText", ""),
+            'budgetMin': job["request"].get("budgetMin"),
+            'budgetMax': job["request"].get("budgetMax"),
+        }
+        
+        system_prompt = build_verify_prompt(preferences_dict)
+        
         result=await quality.json(
-            "Verify this itinerary using only supplied facts. Provide a trip description and reasons for each item. Return JSON with format: {\"description\":\"...\",\"reasons\":{\"itemName\":\"reason\",...}}",
-            {"preferences":job["request"].get("preferenceText",""),"items":enriched_items},
+            system_prompt,
+            {"items":enriched_items},
             max_tokens=8192
         )
-        desc=(result or {}).get("description") or "Lịch trình được cân bằng theo thời gian, khoảng cách và sở thích đã cung cấp."
-        reasons=(result or {}).get("reasons",{})
+        
+        # Check validation result
+        if result:
+            is_valid = result.get("valid", True)  # Default true for backward compatibility
+            violations = result.get("violations", [])
+            
+            if not is_valid and violations:
+                # Itinerary failed validation
+                error_msg = "Itinerary validation failed:\n- " + "\n- ".join(violations)
+                logger.error(error_msg)
+                raise Exception(f"Constraint violations detected: {'; '.join(violations[:3])}")  # First 3 violations
+            
+            desc = result.get("description") or "Lịch trình được cân bằng theo thời gian, khoảng cách và sở thích đã cung cấp."
+            reasons = result.get("reasons", {})
+        else:
+            desc = "Lịch trình được cân bằng theo thời gian, khoảng cách và sở thích đã cung cấp."
+            reasons = {}
+        
         for x in s["items"]:
             if x["type"]!="TRANSPORT":x["description"]=reasons.get(x["name"],x.get("description") or "Phù hợp với nhịp độ và tuyến đường trong ngày.")
         return {"items":s["items"],"description":desc}
@@ -572,6 +500,9 @@ async def run_job(job,token):
     try:
         graph=await build_workflow(job,token);await graph.ainvoke({"job":job})
     except Exception as exc:
-        try: await java.event("FAILED",0,"ai_trip.failed","FAILED",str(exc)[:1000])
-        except Exception: pass
+        logger.error(f"Job failed: {type(exc).__name__}: {str(exc)}")
+        try: 
+            await java.event("FAILED",0,"ai_trip.failed","FAILED",str(exc)[:1000])
+        except Exception as report_err:
+            logger.error(f"Failed to report error: {report_err}")
         raise
