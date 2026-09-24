@@ -1,422 +1,482 @@
+"""LangGraph pipeline for one AI trip job.
+
+validate -> retrieve -> web_research -> curate_web -> resolve_places -> plan -> verify -> commit
+
+The AI owns the itinerary: ONE call per destination returns places, days, times, order, rest
+blocks and all wording. Code prepares a compact candidate shortlist, fetches the editable rules
+from the `config` table, guards the result against what Java's commit rejects, and logs checks.
+If the model fails, a code-only fallback (scheduler.py) still produces a valid trip.
+"""
 from __future__ import annotations
-import asyncio, math, logging
+import asyncio, logging, time
 from datetime import date
 from typing import Any, TypedDict
 import httpx
 from langgraph.graph import StateGraph, START, END
+from . import config
+from .candidates import (ALL_GROUPS, FOOD, bucket, capacity, compact_for_plan, destination_dates,
+                         is_food, merge, normalize, pace_plan, quality, research_needs, row_key)
+from .geo import WEEKDAYS, haversine_km
+from .itinerary import append_missing_social_items, materialize
 from .llm import CachedModel
-from .prompts import build_filter_prompt, build_enrichment_prompt, build_verify_prompt
+from .prompts import (CONFIG_LABEL, DEFAULT_DESCRIPTION_MAX_CHARS, KEY_DESCRIPTION_MAX_CHARS, build_itinerary_prompt)
+from .research import WebResearcher
+from .scheduler import intercity_transport, schedule_destination
+from .validators import check, finalize, strip_internal
 
 logger = logging.getLogger(__name__)
 
+
 class State(TypedDict, total=False):
-    job: dict[str,Any]
-    inventories: list[list[dict[str,Any]]]
-    filtered: list[list[dict[str,Any]]]
-    enriched: list[list[dict[str,Any]]]
-    selected: list[list[dict[str,Any]]]
-    items: list[dict[str,Any]]
+    job: dict[str, Any]
+    cfg: dict[str, str]
+    inventories: list[list[dict]]
+    raw_web: list[list[dict]]
+    curated_web: list[list[dict]]
+    items: list[dict]
     description: str
+    violations: list[str]
+
 
 class JavaClient:
-    def __init__(self, job: dict[str,Any], token: str): self.job=job; self.token=token
+    def __init__(self, job: dict[str, Any], token: str):
+        self.job, self.token = job, token
+
     @property
-    def root(self): return self.job["callbackBaseUrl"].rstrip("/")+f"/v1/api/internal/ai-trip-generations/{self.job['jobId']}"
+    def root(self) -> str:
+        return self.job["callbackBaseUrl"].rstrip("/") + f"/v1/api/internal/ai-trip-generations/{self.job['jobId']}"
+
     @property
-    def headers(self): return {"X-Internal-Token":self.token,"X-Attempt-Id":self.job["attemptId"]}
-    async def event(self,stage,progress,key,status="RUNNING",error=None):
-        body={"attemptId":self.job["attemptId"],"stage":stage,"status":status,"progress":progress,"messageKey":key,"params":{},"errorMessage":error}
-        async with httpx.AsyncClient(timeout=30) as c: (await c.post(self.root+"/events",headers=self.headers,json=body)).raise_for_status()
-    async def candidates(self,d):
-        body={"latitude":d["latitude"],"longitude":d["longitude"],"placeGroups":[x.upper() for x in self.job["request"].get("placeGroups",[])],"limit":250}
-        async with httpx.AsyncClient(timeout=60) as c:
-            r=await c.post(self.root+"/candidates",headers=self.headers,json=body);r.raise_for_status();return r.json()["data"]
-    async def commit(self,items,description):
-        body={"attemptId":self.job["attemptId"],"items":items,"tripDescription":description}
-        async with httpx.AsyncClient(timeout=90) as c:
-            r=await c.post(self.root+"/commit",headers=self.headers,json=body)
-            
-            if r.status_code != 200:
-                logger.error(f"Commit failed: {r.status_code} - {r.text}")
+    def headers(self) -> dict[str, str]:
+        return {"X-Internal-Token": self.token, "X-Attempt-Id": self.job["attemptId"]}
+
+    async def event(self, stage: str, progress: int, key: str, status: str = "RUNNING", error: str | None = None,
+                    params: dict | None = None) -> None:
+        body = {"attemptId": self.job["attemptId"], "stage": stage, "status": status, "progress": progress,
+                "messageKey": key, "params": params or {}, "errorMessage": error}
+        async with httpx.AsyncClient(timeout=30) as c:
+            (await c.post(self.root + "/events", headers=self.headers, json=body)).raise_for_status()
+
+    async def config(self) -> dict[str, str]:
+        """Editable prompt rules from the `config` table (label AI_TRIP). Empty dict on any failure."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(self.root + "/config", headers=self.headers)
                 r.raise_for_status()
-            
-            response_json = r.json()
-            
-            # Check if backend returned business error (meta.code exists and != 200000)
-            # Backend uses 200000 for SUCCESS, not 200
-            if "meta" in response_json:
-                code = response_json["meta"].get("code")
-                if code and code != 200000:
-                    error_msg = response_json["meta"].get("message", "Business error")
-                    logger.error(f"Business error from backend: code={code}, message={error_msg}")
-                    raise Exception(error_msg)
-            
-            # Success case: return data
-            return response_json.get("data")
+                data = r.json().get("data") or {}
+                return {str(k): str(v) for k, v in data.items() if v is not None}
+        except Exception as e:
+            logger.warning("config fetch failed, using built-in rules: %s", e)
+            return {}
 
-def haversine(a,b):
-    p1,p2=math.radians(float(a["latitude"])),math.radians(float(b["latitude"]));dp=p2-p1;dl=math.radians(float(b["longitude"])-float(a["longitude"]));q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2;return 6371*2*math.atan2(math.sqrt(q),math.sqrt(1-q))
+    async def candidates(self, d: dict, groups: list[str], limit: int) -> list[dict]:
+        body = {"latitude": d["latitude"], "longitude": d["longitude"], "placeGroups": groups, "limit": limit}
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(self.root + "/candidates", headers=self.headers, json=body)
+            r.raise_for_status()
+            return r.json().get("data") or []
 
-def destination_days(d): return (date.fromisoformat(d["endDate"])-date.fromisoformat(d["startDate"])).days+1
-
-async def build_workflow(job,token):
-    java=JavaClient(job,token);cheap=CachedModel("CHEAP_LLM");quality=CachedModel("CHEAP_LLM")  # Use CHEAP_LLM (flash) for both
-    async def validate(s): await java.event("VALIDATING",5,"ai_trip.validating");return s
-    async def retrieve(s):
-        await java.event("RETRIEVING",15,"ai_trip.retrieving")
-        inv=await asyncio.gather(*(java.candidates(d) for d in job["request"]["destinations"]))
-        return {"inventories":inv}
-    
-    async def fast_filter(s):
-        """Fast filter: rank ALL places by relevance with compact format."""
-        await java.event("FAST_FILTER",30,"ai_trip.fast_filter")
-        prefs=job["request"].get("preferenceText",""); filtered=[]
-        
-        # Build rich context prompt
-        preferences_dict = {
-            'placeGroups': job["request"].get("placeGroups", []),
-            'pace': job["request"].get("pace", "BALANCED"),
-            'groupComposition': job["request"].get("groupComposition", ""),
-            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
-            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
-            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
-            'activityTypes': job["request"].get("activityTypes", []),
-            'preferenceText': prefs,
-            'budgetMin': job["request"].get("budgetMin"),
-            'budgetMax': job["request"].get("budgetMax"),
+    async def resolve_candidates(self, d: dict, candidates: list[dict]) -> list[dict]:
+        if not candidates:
+            return []
+        body = {
+            "latitude": d["latitude"], "longitude": d["longitude"],
+            "candidates": [{
+                "candidateId": row.get("candidateId"), "title": row.get("title"),
+                "placeGroup": row.get("placeGroup"),
+            } for row in candidates],
         }
-        
-        system_prompt = build_filter_prompt(preferences_dict)
-        
-        for d,inv in zip(job["request"]["destinations"],s["inventories"]):
-            # Send ALL places with compact format (like deep_select)
-            compact_places = []
-            for p in inv:
-                # Build compact info string
-                info_parts = []
-                if p.get("name"):
-                    info_parts.append(p["name"])
-                if p.get("address"):
-                    info_parts.append(p["address"])
-                if p.get("category"):
-                    info_parts.append(p["category"])
-                
-                place = {
-                    "id": p["id"],
-                    "info": ", ".join(info_parts) if info_parts else ""
-                }
-                
-                # Add calculatedScore
-                score = p.get("calculatedScore") or p.get("rating", 0)
-                if score and score > 0:
-                    place["score"] = score
-                
-                # Flatten attributes
-                attrs = p.get("attributes", {})
-                if attrs:
-                    attr_parts = []
-                    for key, val in attrs.items():
-                        if isinstance(val, dict) and 'value' in val:
-                            val = val['value']
-                        if isinstance(val, bool):
-                            attr_parts.append(f"{key}={str(val).lower()}")
-                        elif val:
-                            attr_parts.append(f"{key}={val}")
-                    if attr_parts:
-                        place["attributes"] = ", ".join(attr_parts)
-                
-                compact_places.append(place)
-            
-            cheap_result=await cheap.json(
-                system_prompt + f"\n\nReturn JSON: {{\"ids\":[\"id1\",\"id2\",...]}}\nSelect ALL relevant place IDs in priority order (most relevant first).",
-                {"places":compact_places},
-                max_tokens=4096
-            )
-            
-            # Preserve LLM ordering
-            if cheap_result and cheap_result.get("ids"):
-                id_to_place = {str(p["id"]): p for p in inv}
-                selected = [id_to_place[pid] for pid in cheap_result["ids"] if pid in id_to_place]
-                filtered.append(selected)
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(self.root + "/resolve-candidates", headers=self.headers, json=body)
+            r.raise_for_status()
+            return r.json().get("data") or []
+
+    async def commit(self, items: list[dict], description: str) -> Any:
+        body = {"attemptId": self.job["attemptId"], "items": items, "tripDescription": description}
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(self.root + "/commit", headers=self.headers, json=body)
+            if r.status_code != 200:
+                logger.error("commit failed: %s %s", r.status_code, r.text[:500])
+                r.raise_for_status()
+            data = r.json()
+            meta = data.get("meta") or {}
+            if meta.get("code") and meta["code"] != 200000:
+                raise RuntimeError(meta.get("message") or "commit rejected")
+            return data.get("data")
+
+
+# ------------------------------------------------------------------ helpers
+def _day_number(first_start: date, d: date) -> int:
+    return (d - first_start).days + 1
+
+
+def _validate_destinations(dests: list[dict]) -> None:
+    prev_start = None
+    for d in dests:
+        start, end = date.fromisoformat(d["startDate"]), date.fromisoformat(d["endDate"])
+        if end < start:
+            raise RuntimeError(f"Destination '{d.get('name') or ''}' has endDate before startDate")
+        if prev_start is not None and start < prev_start:
+            raise RuntimeError("Destinations are not in chronological order")
+        prev_start = start
+
+
+def _resolve_dest_dates(dests: list[dict]) -> list[list[date]]:
+    """Each destination's dates, with shared handover days given to exactly one of them.
+
+    When destination i starts on the day destination i-1 ends, both would otherwise plan a
+    full day for the same dayNumber. The arriving destination keeps the day (the traveller
+    spends its afternoon/evening there); a 1-day destination keeps its only day and the
+    other side gives up instead."""
+    all_dates = [destination_dates(d) for d in dests]
+    for i in range(1, len(all_dates)):
+        prev, cur = all_dates[i - 1], all_dates[i]
+        while cur and prev and cur[0] <= prev[-1]:
+            if len(prev) > 1 or len(cur) == 1:
+                if cur[0] == prev[-1]:
+                    prev.pop()
+                else:
+                    cur.pop(0)
             else:
-                # Fallback: ALL places sorted by calculatedScore or rating
-                filtered.append(sorted(inv, key=lambda p: p.get("calculatedScore") or p.get("rating", 0), reverse=True))
-        
-        return {"filtered":filtered}
-    
-    async def deep_select(s):
-        """Deep select: LLM generates full itinerary with scheduling for each day."""
-        await java.event("DEEP_SELECT",50,"ai_trip.deep_select")
-        prefs=job["request"].get("preferenceText","")
-        all_items=[]
-        
-        # Build rich context prompt
-        preferences_dict = {
-            'placeGroups': job["request"].get("placeGroups", []),
-            'pace': job["request"].get("pace", "BALANCED"),
-            'groupComposition': job["request"].get("groupComposition", ""),
-            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
-            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
-            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
-            'activityTypes': job["request"].get("activityTypes", []),
-            'preferenceText': prefs,
-            'budgetMin': job["request"].get("budgetMin"),
-            'budgetMax': job["request"].get("budgetMax"),
-        }
-        
-        system_prompt = build_enrichment_prompt(preferences_dict)
-        
-        day_offset = 0
-        for d,places in zip(job["request"]["destinations"],s["filtered"]):
-            days = destination_days(d)
-            # Dynamic limit based on days
-            max_places = min(len(places), days * 12)  # More places for LLM to choose
-            places_to_send = places[:max_places]
-            
-            # Send compact format with description
-            compact_places = []
-            for p in places_to_send:
-                # Build compact info string
-                info_parts = []
-                if p.get("name"):
-                    info_parts.append(p["name"])
-                if p.get("address"):
-                    info_parts.append(p["address"])
-                if p.get("category"):
-                    info_parts.append(p["category"])
-                
-                place = {
-                    "id": p["id"],
-                    "info": ", ".join(info_parts) if info_parts else ""
-                }
-                
-                # Add score
-                score = p.get("calculatedScore") or p.get("rating", 0)
-                if score and score > 0:
-                    place["score"] = score
-                
-                # Flatten attributes
-                attrs = p.get("attributes", {})
-                if attrs:
-                    attr_parts = []
-                    for key, val in attrs.items():
-                        if isinstance(val, dict) and 'value' in val:
-                            val = val['value']
-                        if isinstance(val, bool):
-                            attr_parts.append(f"{key}={str(val).lower()}")
-                        elif val:
-                            attr_parts.append(f"{key}={val}")
-                    if attr_parts:
-                        place["attributes"] = ", ".join(attr_parts)
-                
-                # Add description if present
-                if p.get("description"):
-                    place["description"] = p["description"]
-                
-                # Add types as comma-separated string
-                types = p.get("types", [])
-                if types:
-                    place["types"] = ", ".join(types)
-                
-                # Add openingHours if present
-                if p.get("openingHours"):
-                    place["openingHours"] = p["openingHours"]
-                
-                # Add visitDurationMinutes if present
-                if p.get("visitDurationMinutes"):
-                    place["visitDurationMinutes"] = p["visitDurationMinutes"]
-                
-                # Add lat/long for transport calculation
-                if p.get("latitude"):
-                    place["latitude"] = p["latitude"]
-                if p.get("longitude"):
-                    place["longitude"] = p["longitude"]
-                
-                compact_places.append(place)
-            
-            # Ask LLM to generate full itinerary (PLACE_VISIT items only)
-            prompt = system_prompt + f"""
+                cur.pop(0)
+    return all_dates
 
-Generate a complete {days}-day itinerary with place visits only (NO transport items).
 
-Return JSON array of items with this EXACT format:
-[
-  {{
-    "type": "PLACE_VISIT",
-    "placeId": "id from input",
-    "name": "place name",
-    "dayNumber": {day_offset + 1} to {day_offset + days},
-    "sortOrder": 0,
-    "startTime": "HH:MM:SS",
-    "endTime": "HH:MM:SS",
-    "category": "food_and_drink|attraction|activity|shopping|accommodation|nightlife"
-  }},
-  ...
-]
+def _spread_by_group(rows: list[dict], limit: int, key=quality) -> list[dict]:
+    """Round-robin over place groups so one dominant group cannot crowd out the others."""
+    groups = {g: sorted(v, key=key, reverse=True) for g, v in bucket(rows).items() if v}
+    out: list[dict] = []
+    while len(out) < limit and any(groups.values()):
+        for g in list(groups):
+            if groups[g] and len(out) < limit:
+                out.append(groups[g].pop(0))
+    return out
 
-CRITICAL RULES:
-- Start each day around 08:00-09:00
-- Include breakfast (08:00-09:30), lunch (12:00-13:30), dinner (18:00-21:00)
-- Balance categories: max 40% food_and_drink, include attractions/activities
-- End day around 21:00-22:00 for Balanced pace
-- Leave realistic gaps between activities for travel time
-- sortOrder: sequential (0, 1, 2, ...)
-- NO TRANSPORT items, only PLACE_VISIT
-"""
 
-            quality_result = await quality.json(
-                prompt,
-                {"places": compact_places, "days": days, "dayOffset": day_offset},
-                max_tokens=32768
-            )
-            
-            logger.info(f"Deep select for destination {d.get('name', 'unknown')}: sent {len(compact_places)} places")
-            
-            if quality_result and isinstance(quality_result, list):
-                logger.info(f"Successfully generated {len(quality_result)} itinerary items")
-                all_items.extend(quality_result)
+def shortlist(rows: list[dict], pace: str | None, days: int) -> tuple[list[dict], list[dict]]:
+    """Compact candidate set for the model: enough food for 3 meals/day with breakfast-capable
+    venues guaranteed, and activities spread across groups. Pure code, no LLM."""
+    cap = capacity(pace, days)
+    social = [r for r in rows if r.get("source") == "social"]
+    food_all = sorted((r for r in rows if is_food(r)), key=quality, reverse=True)
+    social_food = [r for r in social if is_food(r)]
+    breakfasty = [r for r in food_all if "breakfast" in (r.get("meals") or []) or _looks_breakfast(r)]
+    food, seen = [], set()
+    for r in [*breakfasty[: max(4, days * 2)], *food_all]:
+        key = row_key(r)
+        if key not in seen:
+            seen.add(key)
+            food.append(r)
+    food_limit = max(16, cap["meals"] * 3)
+    food = food[:food_limit]
+    # A social row is pinned by the source video and must never be removed by the catalogue cap.
+    food = social_food + [r for r in food if r not in social_food]
+    acts_limit = max(14, int(cap["activities"] * 3))
+    acts = [r for r in social if not is_food(r) and r["placeGroup"] != "ACCOMMODATION"]
+    social_activity_keys = {row_key(r) for r in acts}
+    acts += [r for r in _spread_by_group(
+        [r for r in rows if r.get("source") != "social" and not is_food(r)
+         and r["placeGroup"] != "ACCOMMODATION"],
+        acts_limit,
+    ) if row_key(r) not in social_activity_keys]
+    return food, acts
+
+
+def _destination_center(destination: dict, rows: list[dict]) -> dict:
+    latitude, longitude = destination.get("latitude"), destination.get("longitude")
+    if latitude is not None and longitude is not None:
+        return {"latitude": float(latitude), "longitude": float(longitude)}
+    for row in rows:
+        if row.get("latitude") is not None and row.get("longitude") is not None:
+            return {"latitude": row["latitude"], "longitude": row["longitude"]}
+    return {"latitude": 0.0, "longitude": 0.0}
+
+
+def _research_destination_input(destination: dict, fallback_name: str | None = None) -> dict:
+    """Guarantee usable AI Web-research context without changing the persisted request.
+
+    The V2 contract validates coordinates but makes ``destinations[].name`` optional.  A blank
+    name used to make the researcher return before creating a query. Use the primary city name
+    when available; for later unnamed destinations the planner receives coordinate context too.
+    """
+    out = dict(destination)
+    name = str(out.get("name") or "").strip() or str(fallback_name or "").strip()
+    if not name and out.get("latitude") is not None and out.get("longitude") is not None:
+        name = f"{float(out['latitude']):.5f},{float(out['longitude']):.5f}"
+    out["name"] = name
+    return out
+
+
+def _looks_breakfast(r: dict) -> bool:
+    from .candidates import meal_hint
+    return "breakfast" in meal_hint(r)
+
+
+FALLBACK_DESC = {
+    "vi": "Lịch trình được cân bằng theo sở thích, khoảng cách di chuyển và giờ mở cửa của từng địa điểm.",
+    "en": "An itinerary balanced around your interests, travel distances and each place's opening hours.",
+}
+FALLBACK_NOTE = {"vi": "Phù hợp với nhịp độ và tuyến đường trong ngày.", "en": "Fits the day's pace and route."}
+
+
+# ------------------------------------------------------------------ graph
+async def build_workflow(job: dict[str, Any], token: str):
+    java = JavaClient(job, token)
+    req = job["request"]
+    locale = "vi" if (job.get("locale") or "").lower().startswith("vi") else "en"
+    dests = req["destinations"]
+    pace = req.get("pace") or "BALANCED"
+    selected = [str(g).upper() for g in (req.get("placeGroups") or []) if g]
+    query_groups = list(dict.fromkeys([g for g in selected if g in ALL_GROUPS] + [FOOD])) if selected else ALL_GROUPS
+    first_start = date.fromisoformat(dests[0]["startDate"])
+    total_days = (date.fromisoformat(dests[-1]["endDate"]) - first_start).days + 1
+    _validate_destinations(dests)                # fail fast, before any quota-costing LLM/candidate work
+    dest_dates = _resolve_dest_dates(dests)      # handover days assigned to exactly one destination
+    pace_start_minutes = pace_plan(pace)["start"]
+    model = CachedModel("QUALITY_LLM", "CHEAP_LLM")
+    research_model = CachedModel("CHEAP_LLM")
+
+    async def validate(s: State):
+        await java.event("VALIDATING", 5, "ai_trip.validating")
+        return {"cfg": await java.config()}
+
+    async def retrieve(s: State):
+        await java.event("RETRIEVING", 15, "ai_trip.retrieving")
+
+        async def one(d: dict) -> list[dict]:
+            social_context = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else {}
+            social_rows = [normalize(r, source="social") for r in (social_context.get("candidates") or [])
+                           if isinstance(r, dict)]
+            if d.get("latitude") is not None and d.get("longitude") is not None:
+                lists = await asyncio.gather(*(java.candidates(d, [g], config.CANDIDATES_PER_GROUP) for g in query_groups))
+                catalogue_rows = merge(*([normalize(r) for r in lst] for lst in lists))
             else:
-                # LLM failed - throw error (no fallback)
-                logger.error(f"AI scheduling failed for destination {d.get('name', 'unknown')}")
-                raise Exception("AI trip generation failed: LLM could not generate itinerary")
-            
-            day_offset += days
-        
-        # Sort and reindex
-        all_items.sort(key=lambda x: (x.get("dayNumber", 1), x.get("sortOrder", 0)))
-        for i, item in enumerate(all_items):
-            item["sortOrder"] = i
-        
-        return {"items": all_items, "filtered": s["filtered"]}
-    
-    async def verify(s):
-        await java.event("VERIFYING",88,"ai_trip.verifying")
-        # Build enriched items with full place details for quality LLM
-        enriched_items = []
-        place_map = {}
-        
-        # Build place map from filtered list
-        for places_list in s.get("filtered", []):
-            for p in places_list:
-                place_map[p["id"]] = p
-        
-        for item in s["items"]:
-            enriched = item.copy()
-            if item["type"] == "PLACE_VISIT" and item.get("placeId"):
-                place = place_map.get(item["placeId"])
-                if place:
-                    # Only include non-empty placeDetails fields
-                    details = {}
-                    
-                    if place.get("description"):
-                        details["description"] = place["description"]
-                    
-                    if place.get("about"):
-                        details["about"] = place["about"]
-                    
-                    attrs = place.get("attributes", {})
-                    if attrs:
-                        details["attributes"] = attrs
-                    
-                    if place.get("category"):
-                        details["category"] = place["category"]
-                    
-                    rating = place.get("rating", 0)
-                    if rating and rating > 0:
-                        details["rating"] = rating
-                    
-                    # Only add placeDetails if there's actual data
-                    if details:
-                        enriched["placeDetails"] = details
-            
-            enriched_items.append(enriched)
-        
-        # Build full preferences context
-        preferences_dict = {
-            'placeGroups': job["request"].get("placeGroups", []),
-            'pace': job["request"].get("pace", "BALANCED"),
-            'groupComposition': job["request"].get("groupComposition", ""),
-            'discoveryStyle': job["request"].get("discoveryStyle", "BALANCED"),
-            'dietaryRestrictions': job["request"].get("dietaryRestrictions", []),
-            'mobilityConsiderations': job["request"].get("mobilityConsiderations", []),
-            'activityTypes': job["request"].get("activityTypes", []),
-            'preferenceText': job["request"].get("preferenceText", ""),
-            'budgetMin': job["request"].get("budgetMin"),
-            'budgetMax': job["request"].get("budgetMax"),
-        }
-        
-        system_prompt = build_verify_prompt(preferences_dict)
-        
-        result=await quality.json(
-            system_prompt,
-            {"items":enriched_items},
-            max_tokens=8192
-        )
-        
-        # Check validation result - if violations found, trigger ONE retry
-        if result:
-            is_valid = result.get("valid", True)
-            violations = result.get("violations", [])
-            
-            if not is_valid and violations and not s.get("retry_attempt"):
-                # First validation failure - trigger retry of deep_select
-                logger.warning(f"Itinerary has {len(violations)} violations, triggering retry:")
-                for v in violations[:5]:
-                    logger.warning(f"  - {v}")
-                
-                return {
-                    **s,  # Preserve all state
-                    "needs_retry": True,
-                    "violations": violations,
-                    "retry_attempt": True
-                }
-            elif not is_valid and violations and s.get("retry_attempt"):
-                # Already retried - accept with violations
-                logger.warning(f"Retry still has violations, accepting itinerary:")
-                for v in violations[:5]:
-                    logger.warning(f"  - {v}")
-            
-            desc = result.get("description") or "Lịch trình được cân bằng theo thời gian, khoảng cách và sở thích đã cung cấp."
-            reasons = result.get("reasons", {})
-        else:
-            desc = "Lịch trình được cân bằng theo thời gian, khoảng cách và sở thích đã cung cấp."
-            reasons = {}
-        
-        for x in s["items"]:
-            if x["type"]!="TRANSPORT":x["description"]=reasons.get(x["name"],x.get("description") or "Phù hợp với nhịp độ và tuyến đường trong ngày.")
-        
-        return {"items":s["items"],"description":desc,"needs_retry":False}
-    def should_retry(s):
-        """Check if needs retry based on validation violations."""
-        return "retry" if s.get("needs_retry") else "commit"
-    
-    async def commit(s): await java.event("SAVING",94,"ai_trip.saving");await java.commit(s["items"],s["description"]);return s
-    
-    graph=StateGraph(State)
-    # Register nodes (removed select and schedule)
-    for name,node in [("validate",validate),("retrieve",retrieve),("fast_filter",fast_filter),("deep_select",deep_select),("verify",verify),("commit",commit)]:graph.add_node(name,node)
-    
-    # Build graph edges
-    graph.add_edge(START,"validate")
-    graph.add_edge("validate","retrieve")
-    graph.add_edge("retrieve","fast_filter")
-    graph.add_edge("fast_filter","deep_select")
-    graph.add_edge("deep_select","verify")
-    
-    # Conditional edge: retry goes back to deep_select, otherwise commit
-    graph.add_conditional_edges("verify",should_retry,{"retry":"deep_select","commit":"commit"})
-    graph.add_edge("commit",END)
-    
+                # An unresolved social destination is still a valid input. The source rows are
+                # enough for the planner; do not call Java's coordinate-required catalogue API.
+                catalogue_rows = []
+            rows = merge(social_rows, catalogue_rows)
+            logger.info("retrieve %s: %s", d.get("name"), {g: len(v) for g, v in bucket(rows).items() if v})
+            return rows
+
+        return {"inventories": list(await asyncio.gather(*(one(d) for d in dests)))}
+
+    async def web_research(s: State):
+        inventories = list(s["inventories"])
+        raw_web: list[list[dict]] = [[] for _ in dests]
+
+        async def report(kind: str, params: dict):
+            try:
+                await java.event("RESEARCHING", 25, "ai_trip.researching", params=params)
+            except Exception as e:  # progress is best effort
+                logger.warning("event failed: %s", e)
+
+        # One TOTAL research budget for the whole job, split across every routable destination.
+        # AI-led Web research is mandatory even when the local catalogue is already sufficient.
+        remaining = float(config.WEB_RESEARCH_BUDGET_SECONDS)
+        researching = [
+            (i, _research_destination_input(d, req.get("cityName") if i == 0 else None), research_needs(
+                inventories[i], pace, len(dest_dates[i]), selected,
+                config.WEB_RESEARCH_MIN_CANDIDATES_PER_GROUP,
+            ))
+            for i, d in enumerate(dests)
+            if dest_dates[i] and d.get("latitude") is not None and d.get("longitude") is not None
+        ]
+        for pos, (i, d, needs) in enumerate(researching):
+            if remaining <= 0:
+                logger.warning("research budget exhausted; skipping %s (%s)", d.get("name"), needs)
+                continue
+            destinations_left = len(researching) - pos
+            researcher = WebResearcher(
+                locale=locale,
+                request=req,
+                query_model=research_model,
+                reporter=report,
+            )
+            if not researcher.enabled:
+                raise RuntimeError("AI Web research is unavailable: configure CHEAP_LLM_* with a Responses/Web Search-capable provider")
+            await java.event("RESEARCHING", 25, "ai_trip.researching", params={"destination": d.get("name") or "", "needs": needs})
+            started = time.monotonic()
+            budget = max(1, int(remaining / destinations_left))
+            try:
+                # Search is independent of the local catalogue: an existing title still needs
+                # citation evidence and Java will later resolve the identity in one controlled step.
+                rows = await asyncio.wait_for(researcher.research_destination(d, needs, []), timeout=budget)
+            except TimeoutError as exc:
+                raise RuntimeError(f"AI Web research timed out for {d.get('name') or 'destination'}") from exc
+            remaining -= time.monotonic() - started
+            raw_web[i] = rows
+        return {"inventories": inventories, "raw_web": raw_web}
+
+    async def curate_web(s: State):
+        await java.event("WEB_CURATING", 38, "ai_trip.web_curating")
+        curated: list[list[dict]] = []
+        for i, rows in enumerate(s.get("raw_web") or []):
+            if not rows:
+                curated.append([])
+                continue
+            destination = _research_destination_input(dests[i], req.get("cityName") if i == 0 else None)
+            researcher = WebResearcher(locale=locale, request=req, query_model=research_model)
+            selected_rows = await researcher.curate_candidates(destination, rows)
+            curated.append(selected_rows)
+            logger.info("curate %s: %d -> %d Web candidates", destination.get("name"), len(rows), len(selected_rows))
+        return {"curated_web": curated}
+
+    async def resolve_places(s: State):
+        await java.event("RESOLVING_PLACES", 44, "ai_trip.resolving_places")
+        inventories = list(s["inventories"])
+        curated = s.get("curated_web") or [[] for _ in dests]
+        for i, rows in enumerate(curated):
+            if not rows or dests[i].get("latitude") is None or dests[i].get("longitude") is None:
+                continue
+            resolved = await java.resolve_candidates(dests[i], rows)
+            by_id = {str(row.get("candidateId")): row for row in resolved if isinstance(row, dict) and row.get("candidateId")}
+            enriched: list[dict] = []
+            for raw in rows:
+                result = by_id.get(str(raw.get("candidateId")))
+                if result:
+                    # Keep the Web rationale/citations from Python; trust only identity/location
+                    # fields returned by Java's exact DB/Goong resolver.
+                    row = {**raw, **result, "sourceUrls": raw.get("sourceUrls") or [],
+                           "sourceTitles": raw.get("sourceTitles") or [], "why": raw.get("why") or ""}
+                    enriched.append(normalize(row, source="web"))
+                else:
+                    enriched.append(raw)
+            # Resolved candidates go first so their cited context is retained when they equal a
+            # catalogue place already returned by `retrieve`.
+            inventories[i] = merge(enriched, inventories[i])
+            logger.info("resolve %s: %d candidates", dests[i].get("name"), len(enriched))
+        return {"inventories": inventories}
+
+    async def plan(s: State):
+        await java.event("DEEP_SELECT", 50, "ai_trip.deep_select")
+        cfg = s.get("cfg") or {}
+        max_chars = int(cfg.get(KEY_DESCRIPTION_MAX_CHARS) or DEFAULT_DESCRIPTION_MAX_CHARS)
+
+        async def ask(i: int) -> Any:
+            d, rows, dates = dests[i], s["inventories"][i], dest_dates[i]
+            if not dates or not rows:
+                return None
+            day_numbers = [_day_number(first_start, x) for x in dates]
+            weekdays = [WEEKDAYS[x.weekday()] for x in dates]
+            food, acts = shortlist(rows, pace, len(dates))
+            first_note = last_note = ""
+            if i > 0:
+                km = haversine_km(dests[i - 1], d)
+                first_note = (f"arrival day after a ~{int(km / 55 * 60) + 30}-minute drive from {dests[i - 1].get('name')}: start around "
+                              f"{(pace_start_minutes + int(km / 55 * 60) + 45) // 60:02d}:00" if km < 150
+                              else f"arrival morning after an overnight leg from {dests[i - 1].get('name')} (arrive ~08:00): keep it light")
+            if i + 1 < len(dests) and dest_dates[i + 1]:
+                last_note = f"the traveller moves on to {dests[i + 1].get('name')} afterwards: keep the evening free after dinner"
+            system = build_itinerary_prompt(req, locale, d.get("name") or req.get("cityName") or "", len(dates),
+                                            day_numbers, weekdays, cfg, first_note, last_note)
+            payload = {
+                "destination": d.get("name") or req.get("cityName") or "",
+                "days": [{"dayNumber": n, "date": x.isoformat(), "weekday": w} for n, x, w in zip(day_numbers, dates, weekdays)],
+                "food": [compact_for_plan(r, weekdays) for r in food],
+                "activities": [compact_for_plan(r, weekdays) for r in acts],
+            }
+            out = await model.json(system, payload, max_tokens=12000, temperature=0.5, cache=False)
+            logger.info("plan %s: food=%d acts=%d days=%d llm=%s", d.get("name"), len(food), len(acts), len(dates), out is not None)
+            return out
+
+        answers = await asyncio.gather(*(ask(i) for i in range(len(dests))))
+
+        await java.event("BUILDING_ITINERARY", 78, "ai_trip.building_itinerary")
+        items: list[dict] = []
+        descriptions: list[str] = []
+        used: set[str] = set()
+        first_day_delay = 0
+        for i, (d, rows, ai) in enumerate(zip(dests, s["inventories"], answers)):
+            dates = dest_dates[i]
+            if not dates:
+                logger.warning("destination %s lost all its days to overlap resolution; skipping", d.get("name"))
+                continue
+            day_numbers = [_day_number(first_start, x) for x in dates]
+            center = _destination_center(d, rows)
+            first_start_min = pace_start_minutes + first_day_delay if first_day_delay else None
+            try:
+                dest_items, desc, notes = materialize(ai, rows, day_numbers, dates, pace, locale, used,
+                                                      max_chars=max_chars, first_day_start=first_start_min)
+                if desc:
+                    descriptions.append(desc)
+            except ValueError as e:
+                logger.warning("AI itinerary unusable for %s (%s); using code-only fallback", d.get("name"), e)
+                dest_items, _, notes = schedule_destination(None, rows, day_numbers, dates, pace, center, locale, used,
+                                                            first_day_delay=first_day_delay)
+                # No LLM wording in the fallback: use the place's own blurb, else a neutral line.
+                blurbs = {row_key(r): (r.get("description") or "") for r in rows}
+                for it in dest_items:
+                    if it["type"] == "TRANSPORT":
+                        continue
+                    text = it.get("description") or blurbs.get(it.get("_placeKey")) or FALLBACK_NOTE[locale]
+                    it["description"] = text[:max_chars] or None
+            for n in notes:
+                logger.info("itinerary %s: %s", d.get("name"), n)
+            dest_items = append_missing_social_items(
+                dest_items,
+                rows,
+                day_numbers,
+                dates,
+                pace,
+                locale,
+                max_chars=max_chars,
+            )
+            items += dest_items
+            first_day_delay = 0
+            nxt = next((j for j in range(i + 1, len(dests)) if dest_dates[j]), None)
+            if nxt is not None:
+                km = haversine_km(d, dests[nxt])
+                arrive_day = _day_number(first_start, dest_dates[nxt][0])
+                last_day = day_numbers[-1]
+                last_end = max((int(it["endTime"][:2]) * 60 + int(it["endTime"][3:5]) for it in dest_items
+                                if it["dayNumber"] == last_day and not it.get("endDayNumber")), default=20 * 60)
+                if km < 150:
+                    minutes = int(km / 55 * 60) + 30
+                    items.append(intercity_transport(d, dests[nxt], arrive_day, pace_start_minutes, locale,
+                                                     same_day=True, minutes=minutes))
+                    first_day_delay = minutes + 15
+                else:
+                    items.append(intercity_transport(d, dests[nxt], last_day, last_end, locale, arrival_day=arrive_day))
+        description = " ".join(dict.fromkeys(descriptions)).strip()[:500] or FALLBACK_DESC[locale]
+        return {"items": items, "description": description}
+
+    async def verify(s: State):
+        await java.event("VERIFYING", 88, "ai_trip.verifying")
+        violations = check(s["items"], pace, total_days)   # log only — the AI's plan is not rewritten here
+        for v in violations:
+            logger.warning("verify: %s", v)
+        return {"violations": violations}
+
+    async def commit(s: State):
+        await java.event("SAVING", 94, "ai_trip.saving")
+        items = strip_internal(finalize(s["items"], total_days))
+        if not any(i["type"] != "TRANSPORT" for i in items):
+            raise RuntimeError("No places available for this destination")
+        await java.commit(items, s["description"])
+        return s
+
+    graph = StateGraph(State)
+    nodes = [("validate", validate), ("retrieve", retrieve), ("web_research", web_research),
+             ("curate_web", curate_web), ("resolve_places", resolve_places), ("plan", plan),
+             ("verify", verify), ("commit", commit)]
+    for name, fn in nodes:
+        graph.add_node(name, fn)
+    graph.add_edge(START, nodes[0][0])
+    for (a, _), (b, _) in zip(nodes, nodes[1:]):
+        graph.add_edge(a, b)
+    graph.add_edge(nodes[-1][0], END)
     return graph.compile()
 
-async def run_job(job,token):
-    java=JavaClient(job,token)
+
+async def run_job(job: dict[str, Any], token: str) -> None:
+    java = JavaClient(job, token)
     try:
-        graph=await build_workflow(job,token);await graph.ainvoke({"job":job})
+        graph = await build_workflow(job, token)
+        await graph.ainvoke({"job": job})
     except Exception as exc:
-        logger.error(f"Job failed: {type(exc).__name__}: {str(exc)}")
-        try: 
-            await java.event("FAILED",0,"ai_trip.failed","FAILED",str(exc)[:1000])
+        logger.exception("job %s failed", job.get("jobId"))
+        try:
+            await java.event("FAILED", 0, "ai_trip.failed", "FAILED", str(exc)[:1000])
         except Exception as report_err:
-            logger.error(f"Failed to report error: {report_err}")
+            logger.error("could not report failure: %s", report_err)
         raise
