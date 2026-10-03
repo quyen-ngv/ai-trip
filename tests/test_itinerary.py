@@ -1,7 +1,7 @@
 """The AI owns the plan; these lock in what the safety net must still guarantee."""
 from datetime import date
 from app.candidates import normalize
-from app.itinerary import append_missing_social_items, materialize
+from app.itinerary import append_missing_social_items, apply_social_texts, materialize, social_trip_text
 from app.validators import finalize, strip_internal
 
 C = (16.0544, 108.2022)
@@ -217,3 +217,46 @@ def test_finalize_repairs_social_day_inversion_and_keeps_options_together():
     assert [item["name"] for item in out] == ["Point one", "Point two"]
     assert [item["dayNumber"] for item in out] == [2, 2]
     assert [item["startTime"] for item in out] == ["12:00:00", "12:00:00"]
+
+
+def _social_row(ref, description="", tips=None, sequence=1):
+    return normalize({
+        "id": None, "candidateRef": ref, "socialJobId": "job", "socialSequence": sequence,
+        "title": f"Stop {ref}", "placeGroup": "OTHER", "resolutionStatus": "RESOLVED",
+        "description": description, "tips": tips or [],
+    }, source="social")
+
+
+def test_video_stops_use_the_extracted_guidance_and_tips_not_the_planner_line():
+    long_text = "Đến trước 6 giờ sáng để kịp biển mây. " * 12
+    row = _social_row("s1", long_text, ["Mang áo khoác", "Vé vào cổng miễn phí"])
+    items = [{"sourceSocialCandidateRef": "s1", "description": "Planner one-liner."},
+             {"description": "Breakfast near the hotel."}]
+
+    apply_social_texts(items, [row])
+
+    assert items[0]["description"].startswith("Đến trước 6 giờ sáng")
+    assert len(items[0]["description"]) > 300  # not cut to the planner's 200-character cap
+    assert items[0]["description"].endswith("• Mang áo khoác\n• Vé vào cổng miễn phí")
+    assert items[1]["description"] == "Breakfast near the hotel."
+
+
+def test_video_stop_without_extracted_text_keeps_the_planner_line():
+    items = [{"sourceSocialCandidateRef": "s1", "description": "Planner one-liner."}]
+    apply_social_texts(items, [_social_row("s1")])
+    assert items[0]["description"] == "Planner one-liner."
+
+
+def test_appended_video_stop_never_talks_about_the_video():
+    items = append_missing_social_items([], [_social_row("s1")], [1], [date(2026, 9, 8)], "BALANCED", "vi")
+    assert "video" not in items[0]["description"].lower()
+
+
+def test_trip_text_is_the_extracted_overview_then_its_advice():
+    text = social_trip_text({
+        "tripDescription": "Hai ngày thong thả giữa đồi chè và quán cà phê.",
+        "generalGuidance": ["Thuê xe máy để đi lại", "Mang áo ấm buổi tối"],
+    })
+    assert text == ("Hai ngày thong thả giữa đồi chè và quán cà phê.\n"
+                    "• Thuê xe máy để đi lại\n• Mang áo ấm buổi tối")
+    assert social_trip_text({}) == ""

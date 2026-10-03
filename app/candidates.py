@@ -83,6 +83,11 @@ def normalize(row: dict, source: str = "db") -> dict:
     if not isinstance(menu, list):
         menu = []
     desc = (row.get("description") or "").strip()
+    # A social row's description and tips are the only record of what the video says about the
+    # stop, and they become the activity's text, so they are kept whole.
+    desc_limit = 1200 if source == "social" else 300
+    tips = [re.sub(r"\s+", " ", tip).strip()[:300] for tip in (row.get("tips") or [])
+            if isinstance(tip, str) and tip.strip()][:8] if source == "social" else []
     return {
         "id": str(row["id"]) if row.get("id") else None,
         "candidateId": str(row.get("candidateId") or row.get("candidateRef") or "") or None,
@@ -98,7 +103,8 @@ def normalize(row: dict, source: str = "db") -> dict:
         "score": _num(row.get("score")),
         "distanceKm": _num(row.get("distanceKm")),
         "visitDurationMinutes": int(_num(row.get("visitDurationMinutes")) or 0) or None,
-        "description": re.sub(r"\s+", " ", desc)[:300],
+        "description": re.sub(r"\s+", " ", desc)[:desc_limit],
+        "tips": tips,
         "why": re.sub(r"\s+", " ", str(row.get("why") or "")).strip()[:220],
         "sourceUrls": [str(url)[:500] for url in (row.get("sourceUrls") or [])
                        if isinstance(url, str) and url.strip()][:3],
@@ -223,20 +229,19 @@ def research_needs(rows: list[dict], pace: str | None, days: int, selected_group
     return {group: max(minimum, missing.get(group, 0)) for group in dict.fromkeys(groups)}
 
 
-def compact_for_plan(r: dict, weekdays: list[str]) -> dict:
-    out: dict[str, Any] = {
-        "id": row_key(r),
-        "candidateId": r.get("candidateId") or row_key(r),
-        "placeId": r.get("id"),
-        "title": r["title"],
-        "group": r["placeGroup"],
-    }
+def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
+    """One candidate as the planner sees it. `ref` is a short alias ("f12", "a3") that the
+    caller maps back to `row_key`: a UUID costs ~20 tokens on the way in and again in every
+    output stop, and short refs are copied back more reliably."""
+    out: dict[str, Any] = {"id": ref, "title": r["title"]}
+    if not is_food(r):
+        out["group"] = r["placeGroup"]
     if r.get("category"):
         out["category"] = r["category"]
     if r.get("fit") is not None:
         out["fit"] = r["fit"]
     if r.get("why"):
-        out["why"] = r["why"]
+        out["why"] = r["why"][:120]
     if r.get("meals"):
         out["meals"] = r["meals"]
     if r.get("reviewRating"):
@@ -246,6 +251,8 @@ def compact_for_plan(r: dict, weekdays: list[str]) -> dict:
     if r.get("latitude") is not None:
         out["lat"] = round(r["latitude"], 4)
         out["lng"] = round(r["longitude"], 4)
+    if r.get("distanceKm") is not None:
+        out["km"] = round(r["distanceKm"], 1)
     if r.get("visitDurationMinutes"):
         out["visitMin"] = r["visitDurationMinutes"]
     if r.get("menuHighlights"):
@@ -256,10 +263,9 @@ def compact_for_plan(r: dict, weekdays: list[str]) -> dict:
     if hours:
         out["hours"] = hours[:200]
     if r.get("source") == "web":
-        out["source"] = "web_research"
-        out["note"] = ("resolved by " + str(r["resolvedBy"]).lower()) if r.get("resolvedBy") else "found through cited Web research; identity unresolved"
-        if r.get("sourceUrls"):
-            out["sources"] = r["sourceUrls"][:3]
+        # Citations stay on the row and reach the activity notes in code; the planner only
+        # needs to know the stop is editorially recommended and whether it has a location.
+        out["source"] = "web" if r.get("latitude") is not None else "web_unlocated"
     if r.get("source") == "social":
         out["source"] = "social_video"
         out["pinned"] = True

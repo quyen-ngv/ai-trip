@@ -343,9 +343,10 @@ def append_missing_social_items(
             end = min(pace["end"], start + _default_minutes(row, pace))
             if group:
                 option_windows[group] = (day, start, end)
-        description = str(row.get("description") or "").strip()
-        if not description:
-            description = "Social video mention; verify before booking." if not locale.startswith("vi") else "Địa điểm được nhắc trong video; hãy kiểm tra lại trước khi đặt dịch vụ."
+        description = social_stop_text(row) or (
+            "Kiểm tra lại địa chỉ và giờ mở cửa trước khi đi." if locale.startswith("vi")
+            else "Check the address and opening hours before you go."
+        )
         item = _item(_Stop(row, start, end, description), day, locale, max_chars)
         item["_socialSequence"] = sequence(row)
         _insert_social_item(items, item)
@@ -354,6 +355,42 @@ def append_missing_social_items(
             day_cursor[day] = max(day_cursor.get(day, 0), end + 10)
 
     return items
+
+
+SOCIAL_TEXT_MAX_CHARS = 1500
+SOCIAL_TIPS_MAX = 6
+
+
+def social_stop_text(row: dict) -> str:
+    """A video stop's guidance written by the extractor, then its tips one per line."""
+    text = str(row.get("description") or "").strip()
+    tips = [tip for tip in (row.get("tips") or []) if tip and tip not in text][:SOCIAL_TIPS_MAX]
+    lines = ([text] if text else []) + [f"• {tip}" for tip in tips]
+    return "\n".join(lines)[:SOCIAL_TEXT_MAX_CHARS]
+
+
+def social_trip_text(social_context: dict) -> str:
+    """The trip overview the extractor wrote from the video, then its general advice."""
+    text = str(social_context.get("tripDescription") or "").strip()
+    advice = [str(tip).strip() for tip in (social_context.get("generalGuidance") or [])
+              if isinstance(tip, str) and tip.strip() and tip.strip() not in text][:SOCIAL_TIPS_MAX]
+    lines = ([text] if text else []) + [f"• {tip}" for tip in advice]
+    return "\n".join(lines)[:SOCIAL_TEXT_MAX_CHARS]
+
+
+def apply_social_texts(items: list[dict], rows: list[dict]) -> None:
+    """Give every video stop the text drawn from the video instead of the planner's one-liner.
+
+    The planner sees a 120-character excerpt and writes a single sentence; the extractor saw the
+    whole video. Stops without extracted text keep whatever the planner wrote.
+    """
+    by_ref = {str(row.get("candidateId")): row for row in rows
+              if row.get("source") == "social" and row.get("candidateId")}
+    for item in items:
+        row = by_ref.get(str(item.get("sourceSocialCandidateRef") or ""))
+        text = social_stop_text(row) if row else ""
+        if text:
+            item["description"] = text
 
 
 def _insert_social_item(items: list[dict], item: dict) -> None:

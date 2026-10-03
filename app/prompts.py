@@ -139,28 +139,32 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
         extra += f"\n- Day {day_numbers[-1]}: {last_day_note}"
     social = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else None
     if social:
-        extra += "\n- SOCIAL VIDEO PRIORITY: candidate order follows the source video. Preserve every candidate, and output options as separate stops sharing one time window. A candidateId is stable even when placeId is absent."
+        extra += "\n- SOCIAL VIDEO PRIORITY: candidate order follows the source video. Preserve every candidate, and output options as separate stops sharing one time window. Every candidate has an id, even when it has no catalogue place."
+        extra += "\n- Write tripDescription and every description as the planner talking to the traveller: practical tips, what to do or eat, timing. Never mention a video, clip, creator or source, and never say the order is kept or follows anything."
         if social.get("durationBasis"):
             extra += f"\n- Social duration decision: {social['durationBasis']}"
-    return f"""You are TripMind, an expert Vietnam travel planner. You produce the COMPLETE itinerary for {destination}: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese.
-
-{preferences_block(req, locale)}
+    # Static text first (identity, rules, input contract) and per-request text last, so providers
+    # with automatic prefix caching (DeepSeek, OpenAI) bill the shared prefix as cached input.
+    return f"""You are TripMind, an expert Vietnam travel planner. You produce the COMPLETE itinerary for one destination: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese.
 
 {plan_rules}
 {traveller_rules}
 
 ## Input
-JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Each candidate: id, candidateId, title, group, category, rating, reviews, km (from centre), lat, lng, visitMin, menu, hours (for the trip's weekdays; may be missing), desc, note. Social candidates may additionally include videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
+JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Each candidate: id (short ref, e.g. "f3"/"a7"), title, group (activities only; every food candidate is a food venue), category, rating, reviews, lat, lng, km (distance from the destination centre), visitMin, menu, hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc, why (editorial reason). source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
+
+## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
+{{"tripDescription":"...","days":[{{"dayNumber":1,"stops":[
+  {{"id":"f3","start":"07:30","end":"08:15","description":"..."}},
+  {{"id":"a7","start":"08:30","end":"10:00","description":"..."}},
+  {{"rest":"hotel","start":"12:30","end":"14:30","description":"..."}}
+]}}]}}
+Every place stop uses the candidate's "id" exactly as given.
+
+{preferences_block(req, locale)}
 
 ## Task
-Plan {days} day(s): {day_list}.{extra}
+Destination: {destination}. Plan {days} day(s): {day_list}.{extra}
 If this is a social-video itinerary, videoSequence is the strongest ordering signal. Do not reorder solely for rating, geography, meals, or opening hours. Keep alternative options as distinct stops (same optionGroupId and same time); the user can choose later.
 Fill every day from morning to evening according to the traveller profile. Times are local "HH:MM", chronological within a day, no overlaps, with realistic travel gaps between stops.
-Write all free text in {language(locale)}. Each stop description <= {max_chars} characters, one sentence. tripDescription <= 2 short sentences.
-
-## Output (JSON only) — exactly {days} entries in "days", in the listed order
-{{"tripDescription":"...","days":[{{"dayNumber":{day_numbers[0]},"theme":"...","stops":[
-  {{"candidateId":"<candidateId>","placeId":"<id-or-omit-if-unresolved>","start":"07:30","end":"08:15","description":"..."}},
-  {{"placeId":"<id>","start":"08:30","end":"10:00","description":"..."}},
-  {{"rest":"hotel","start":"12:30","end":"14:30","description":"..."}}
-]}}]}}"""
+Write all free text in {language(locale)}. Each stop description <= {max_chars} characters, one sentence. tripDescription <= 2 short sentences."""

@@ -1,9 +1,10 @@
 """Thin OpenAI-compatible chat client with JSON output and an optional SQLite cache."""
 from __future__ import annotations
-import asyncio, hashlib, json, logging, os, re, sqlite3
+import asyncio, hashlib, json, logging, os, re, sqlite3, time
 from pathlib import Path
 from typing import Any
 import httpx
+from . import ai_log
 from .config import LLM_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -40,12 +41,12 @@ class CachedModel:
         return bool(self.url and self.key and self.model)
 
     async def json(self, system: str, payload: Any, *, max_tokens: int = 4096, temperature: float = 0.3,
-                   cache: bool = True, retries: int = 1) -> Any | None:
+                   cache: bool = True, retries: int = 1, operation: str = "CHAT") -> Any | None:
         """Call the model and return the parsed JSON (object or array). None on failure."""
         if not self.configured:
             logger.error("LLM %s not configured", self.prefix)
             return None
-        user = json.dumps(payload, ensure_ascii=False)
+        user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         key = hashlib.sha256(json.dumps({"m": self.model, "s": system, "u": user, "t": temperature},
                                         ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         if cache:
@@ -59,8 +60,11 @@ class CachedModel:
         logger.info("LLM call %s model=%s system=%d chars payload=%d chars", self.prefix, self.model, len(system), len(user))
         value = None
         for attempt in range(retries + 1):
-            value = await self._call(body)
-            if value is not None:
+            trace: dict[str, Any] = {}
+            started = time.monotonic()
+            value, retryable = await self._call(body, trace)
+            await self._report(operation, trace, value is not None, int((time.monotonic() - started) * 1000))
+            if value is not None or not retryable:
                 break
             logger.warning("LLM attempt %d failed (%s)", attempt + 1, self.prefix)
             await asyncio.sleep(1.5)
@@ -69,7 +73,20 @@ class CachedModel:
             self.db.commit()
         return value
 
-    async def _call(self, body: dict) -> Any | None:
+    async def _report(self, operation: str, trace: dict[str, Any], ok: bool, latency_ms: int) -> None:
+        data = trace.get("response")
+        input_tokens, cached, output_tokens = ai_log.chat_usage(data)
+        await ai_log.report(operation=operation, provider=ai_log.provider_of(self.url), model=self.model, ok=ok,
+                            request=trace.get("request"), response=data, error=trace.get("error"),
+                            input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
+                            latency_ms=latency_ms)
+
+    async def _call(self, body: dict, trace: dict[str, Any] | None = None) -> tuple[Any | None, bool]:
+        """(parsed JSON or None, whether an identical retry could succeed).
+
+        `trace` receives the request actually sent, the provider's body and any error, for the
+        AI call log."""
+        trace = trace if trace is not None else {}
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
         content = ""
         try:
@@ -91,26 +108,38 @@ class CachedModel:
                     else:
                         break
                     r = await client.post(f"{self.url}/chat/completions", headers=headers, json=body)
+                trace["request"] = body
                 if r.status_code != 200:
+                    trace["error"] = {"httpStatus": r.status_code, "body": r.text[:4000]}
                     logger.error("LLM HTTP %s: %s", r.status_code, r.text[:400])
-                    return None
+                    return None, r.status_code >= 500 or r.status_code == 429
                 data = r.json()
+            trace["response"] = data
+            usage = data.get("usage") or {}
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", usage.get("prompt_cache_hit_tokens"))
+            logger.info("LLM usage %s model=%s prompt=%s cached=%s completion=%s", self.prefix, self.model,
+                        usage.get("prompt_tokens"), cached, usage.get("completion_tokens"))
             choices = data.get("choices") or []
             if not choices:
                 logger.error("LLM returned no choices: %s", str(data)[:400])
-                return None
+                return None, True
             finish = choices[0].get("finish_reason")
             content = (choices[0].get("message") or {}).get("content") or ""
             if finish == "length":
+                trace["error"] = {"reason": "output truncated at max_tokens"}
+                # The same request would be cut at the same place: retrying only doubles the bill.
                 logger.error("LLM output truncated at max_tokens=%s",
                              body.get("max_completion_tokens", body.get("max_tokens")))
-                return None
+                return None, False
             if not content.strip():
                 logger.error("LLM returned empty content (finish=%s)", finish)
-                return None
-            return json.loads(_FENCE.sub("", content))
+                return None, True
+            return json.loads(_FENCE.sub("", content)), False
         except json.JSONDecodeError as e:
+            trace["error"] = {"reason": "answer is not JSON", "message": str(e)}
             logger.error("LLM JSON parse error: %s | head=%r", e, content[:300])
         except Exception as e:  # network, timeout
+            trace.setdefault("request", body)
+            trace["error"] = {"reason": type(e).__name__, "message": str(e)}
             logger.error("LLM error: %s: %s", type(e).__name__, e)
-        return None
+        return None, True

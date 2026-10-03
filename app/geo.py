@@ -90,6 +90,18 @@ def parse_hours_entry(entry: str) -> list[tuple[int, int]] | None:
     return windows or None
 
 
+def _entries(raw: Any) -> list[str]:
+    """A day's display strings, cleaned. Google Maps pads some days with an icon glyph from the
+    Private Use Area (seen: U+E14D) as an extra entry; it is not whitespace, so it used to make
+    the whole day unparseable (196 of ~8,600 weekday lists in a prod sample, 2026-10-02)."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    cleaned = (re.sub(r"\s+", " ", re.sub(r"[-]", "", e)).strip() for e in raw if isinstance(e, str))
+    return [e for e in cleaned if e]
+
+
 def open_windows(open_hours: Any, weekday: str) -> list[tuple[int, int]] | None:
     """Windows for a weekday name ('Monday'). None when hours are unknown/unparseable."""
     if not isinstance(open_hours, dict):
@@ -97,11 +109,7 @@ def open_windows(open_hours: Any, weekday: str) -> list[tuple[int, int]] | None:
     entries = open_hours.get(weekday)
     if entries is None:
         entries = open_hours.get(weekday.lower()) or open_hours.get(weekday[:3])
-    if isinstance(entries, str):
-        entries = [entries]
-    if not isinstance(entries, list):
-        return None
-    entries = [e for e in entries if isinstance(e, str) and e.strip()]
+    entries = _entries(entries)
     if not entries:
         return None
     windows: list[tuple[int, int]] = []
@@ -132,18 +140,44 @@ def next_opening(open_hours: Any, weekday: str, after: int) -> int | None:
     return starts[0] if starts else None
 
 
+def _hhmm(minutes: int) -> str:
+    minutes %= 1440
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _day_hours(entries: Any) -> str:
+    """One weekday's entries as 24h windows ("07:00-22:00,17:00-02:00"); raw text if unparseable."""
+    entries = _entries(entries)
+    if not entries:
+        return ""
+    windows: list[tuple[int, int]] = []
+    for entry in entries:
+        parsed = parse_hours_entry(entry)
+        if parsed is None:
+            return "; ".join(entries)
+        windows += parsed
+    if not windows:
+        return "closed"
+    if windows == [(0, 1440)]:
+        return "24h"
+    return ",".join(f"{_hhmm(s)}-{_hhmm(e)}" for s, e in windows)
+
+
 def hours_summary(open_hours: Any, weekdays: list[str]) -> str:
-    """Compact, model-readable summary limited to the trip's weekdays."""
+    """Compact, model-readable summary limited to the trip's weekdays.
+
+    Each weekday appears once even on long trips, and days sharing the same hours are merged,
+    so a venue open the same hours all week costs a few tokens: "daily 07:00-22:00"."""
     if not isinstance(open_hours, dict):
         return ""
-    parts = []
-    for wd in weekdays:
-        entries = open_hours.get(wd)
-        if isinstance(entries, list):
-            entries = [re.sub(r"\s+", " ", e).strip() for e in entries if isinstance(e, str) and e.strip()]
-            if entries:
-                parts.append(f"{wd[:3]} {'; '.join(entries)}")
-    return " | ".join(parts)
+    by_value: dict[str, list[str]] = {}
+    for wd in dict.fromkeys(weekdays):
+        value = _day_hours(open_hours.get(wd))
+        if value:
+            by_value.setdefault(value, []).append(wd[:3])
+    if len(by_value) == 1 and len(next(iter(by_value.values()))) == len(set(weekdays)):
+        return "daily " + next(iter(by_value))
+    return " | ".join(f"{','.join(days)} {value}" for value, days in by_value.items())
 
 
 def fmt_time(minutes: int) -> str:

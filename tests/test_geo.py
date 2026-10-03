@@ -30,3 +30,20 @@ def test_travel_and_distance():
     assert 0.1 < haversine_km(hanoi, hoan_kiem) < 0.3
     assert travel_estimate(0.5)[0] == "WALKING"
     assert travel_estimate(5.0) == ("TAXI", 20)
+
+
+def test_hours_summary_merges_days_and_lists_each_weekday_once():
+    from app.geo import hours_summary
+    week = {d: ["7:00 AM – 10:00 PM"] for d in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")}
+    ten_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday"]
+    assert hours_summary(week, ten_days) == "daily 07:00-22:00"
+    mixed = {**week, "Sunday": ["Closed"], "Saturday": ["11 AM – 2 AM"], "Friday": ["by appointment"]}
+    assert hours_summary(mixed, ["Thursday", "Friday", "Saturday", "Sunday"]) == \
+        "Thu 07:00-22:00 | Fri by appointment | Sat 11:00-02:00 | Sun closed"
+
+
+def test_icon_glyph_entry_is_ignored():
+    from app.geo import hours_summary
+    hours = {"Monday": ["6:30 AM–12 AM", ""]}          # real Google Maps shape (prod, 2026-10)
+    assert open_windows(hours, "Monday") == [(6 * 60 + 30, 1440)]
+    assert hours_summary(hours, ["Monday"]) == "daily 06:30-00:00"

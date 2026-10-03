@@ -230,3 +230,45 @@ def test_prompt_contains_rules_and_preferences():
     # config overrides the built-in rules
     p2 = build_itinerary_prompt(req, "en", "Huế", 1, [1], ["Monday"], {"PLAN_RULES": "MY CUSTOM RULES"})
     assert "MY CUSTOM RULES" in p2 and "NEVER a cafe" not in p2
+
+
+def test_shortlist_keeps_web_rows_when_catalogue_is_full():
+    from app.candidates import normalize
+    catalogue = [normalize(java_row(i, "FOOD_AND_DRINK")) for i in range(120)]
+    catalogue += [normalize(java_row(1000 + i, "CULTURE_AND_HERITAGE")) for i in range(120)]
+    web = [normalize({"candidateId": f"web:{i}", "title": f"Web {i}", "placeGroup": group,
+                      "latitude": CENTER[0] if i % 2 else None, "longitude": CENTER[1] if i % 2 else None},
+                     source="web")
+           for i, group in enumerate(["FOOD_AND_DRINK"] * 12 + ["CULTURE_AND_HERITAGE"] * 12)]
+    food, acts = workflow.shortlist(web + catalogue, "BALANCED", 3)
+    assert len(food) == 27 and len(acts) == 27                      # caps unchanged
+    web_food = [r for r in food if r["source"] == "web"]
+    web_acts = [r for r in acts if r["source"] == "web"]
+    assert len(web_food) == 6 and len(web_acts) == 9                # 1/4 of food, 1/3 of activities
+    assert all(r["latitude"] is not None for r in web_food)         # located rows go first
+
+
+def test_resolve_refs_maps_short_refs_back_to_row_keys():
+    ai = {"days": [{"dayNumber": 1, "stops": [
+        {"id": "f1", "start": "07:30", "end": "08:15"},
+        {"placeId": "a2", "start": "09:00", "end": "10:00"},
+        {"rest": "hotel", "start": "12:30", "end": "14:00"},
+        {"id": "zz", "start": "15:00", "end": "16:00"},
+    ]}]}
+    stops = workflow.resolve_refs(ai, {"f1": "uuid-food", "a2": "web:abc"})["days"][0]["stops"]
+    assert [s.get("candidateId") for s in stops] == ["uuid-food", "web:abc", None, None]
+
+
+@pytest.mark.asyncio
+async def test_plan_payload_uses_short_refs(monkeypatch):
+    fake_java, fake_llm = FakeJava(), FakeLLM()
+    monkeypatch.setattr(workflow, "JavaClient", lambda job, token: fake_java)
+    monkeypatch.setattr(workflow, "CachedModel", lambda *a, **k: fake_llm)
+    monkeypatch.setattr(workflow, "WebResearcher", NoopWebResearcher)
+    await (await workflow.build_workflow(JOB, "tok")).ainvoke({"job": JOB})
+    system, payload = fake_llm.calls[0]
+    refs = [p["id"] for p in payload["food"] + payload["activities"]]
+    assert all(len(r) <= 4 for r in refs) and len(refs) == len(set(refs))
+    assert not any("candidateId" in p or "placeId" in p or "sources" in p for p in payload["food"] + payload["activities"])
+    # static rules come before the per-request profile so the prefix can be cached
+    assert system.index("## Core planning rules") < system.index("## Traveller profile")

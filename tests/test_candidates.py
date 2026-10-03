@@ -19,9 +19,10 @@ def test_normalize_reads_java_field_names():
     assert len(r["description"]) <= 300 and "  " not in r["description"]
     assert "servesBreakfast" in r["attributes"] and "wheelchair" not in r["attributes"]
     assert r["openHours"] == {"Monday": ["6 AM–9 PM"]}
-    c = compact_for_plan(r, ["Monday"])
+    c = compact_for_plan(r, ["Monday"], "f1")
     assert c["title"] == "Phở Thìn Bờ Hồ" and c["rating"] == 4.3 and c["reviews"] == 2345 and c["menu"]
-    assert c["hours"].startswith("Mon ")
+    assert c["id"] == "f1" and "candidateId" not in c and "placeId" not in c and "group" not in c
+    assert c["hours"] == "daily 06:00-21:00" and c["km"] == 0.4
 
 
 def test_quality_prefers_rated_and_reviewed():

@@ -12,12 +12,13 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
-from . import config
+from . import ai_log, config
 from .candidates import ACTIVITY_GROUPS, FOOD, normalize
 from .llm import CachedModel
 from .research_cache import ResearchCache
@@ -241,7 +242,8 @@ class WebResearcher:
             "queriesRequiredPerGroup": per_group,
             "locale": self.locale,
         }
-        planned = await self.query_model.json(_QUERY_SYSTEM, payload, max_tokens=2500, temperature=0.2, cache=False)
+        planned = await self.query_model.json(_QUERY_SYSTEM, payload, max_tokens=2500, temperature=0.2, cache=False,
+                                              operation="WEB_QUERY_PLAN")
         if not isinstance(planned, dict) or not isinstance(planned.get("queries"), list):
             raise RuntimeError("AI could not create Web research queries")
         grouped: dict[str, list[str]] = {group: [] for group in targets}
@@ -308,18 +310,35 @@ class WebResearcher:
                 },
             },
         }
+        started = time.monotonic()
+        value: Any = None
+        error: Any = None
         try:
             headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             async with httpx.AsyncClient(timeout=config.WEB_RESEARCH_TIMEOUT_SECONDS) as client:
                 response = await client.post(self.endpoint, headers=headers, json=body)
             if response.status_code != 200:
+                error = {"httpStatus": response.status_code, "body": response.text[:4000]}
                 logger.warning("Web research failed (%s): %s", response.status_code, response.text[:400])
                 return None
             value = response.json()
-            return value if isinstance(value, dict) else None
+            if not isinstance(value, dict):
+                error, value = {"reason": "response is not a JSON object"}, None
+                return None
+            input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
+            logger.info("Web research usage group=%s input=%s cached=%s output=%s searches=%d", group,
+                        input_tokens, cached, output_tokens, searches)
+            return value
         except Exception as exc:
+            error = {"reason": type(exc).__name__, "message": str(exc)}
             logger.warning("Web research request failed for %r: %s", query, exc)
             return None
+        finally:
+            input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
+            await ai_log.report(operation="WEB_SEARCH", provider=ai_log.provider_of(self.base_url), model=self.model,
+                                ok=value is not None, request=body, response=value, error=error,
+                                input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
+                                web_search_calls=searches, latency_ms=int((time.monotonic() - started) * 1000))
 
     def _rows_from_response(self, response: dict[str, Any], group: str, known_titles: set[str]) -> list[dict]:
         result = _parse_json(_output_text(response))
@@ -407,7 +426,7 @@ class WebResearcher:
                 "travellerRequest": self._request_context(),
                 "maxPerGroup": config.WEB_CURATION_MAX_PER_GROUP,
                 "candidates": evidence,
-            }, max_tokens=3000, temperature=0.1, cache=False)
+            }, max_tokens=3000, temperature=0.1, cache=False, operation="WEB_CURATE")
             if not isinstance(result, dict) or not isinstance(result.get("candidateIds"), list):
                 raise RuntimeError("AI could not curate Web research candidates")
             ids = {str(value) for value in result["candidateIds"]}

@@ -13,11 +13,11 @@ from datetime import date
 from typing import Any, TypedDict
 import httpx
 from langgraph.graph import StateGraph, START, END
-from . import config
+from . import ai_log, config
 from .candidates import (ALL_GROUPS, FOOD, bucket, capacity, compact_for_plan, destination_dates,
                          is_food, merge, normalize, pace_plan, quality, research_needs, row_key)
 from .geo import WEEKDAYS, haversine_km
-from .itinerary import append_missing_social_items, materialize
+from .itinerary import append_missing_social_items, apply_social_texts, materialize, social_trip_text
 from .llm import CachedModel
 from .prompts import (CONFIG_LABEL, DEFAULT_DESCRIPTION_MAX_CHARS, KEY_DESCRIPTION_MAX_CHARS, build_itinerary_prompt)
 from .research import WebResearcher
@@ -91,6 +91,11 @@ class JavaClient:
             r.raise_for_status()
             return r.json().get("data") or []
 
+    async def ai_call(self, entry: dict) -> None:
+        """One AI provider call for the call log. Short timeout: the log must not slow the job."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            (await c.post(self.root + "/ai-calls", headers=self.headers, json=entry)).raise_for_status()
+
     async def commit(self, items: list[dict], description: str) -> Any:
         body = {"attemptId": self.job["attemptId"], "items": items, "tripDescription": description}
         async with httpx.AsyncClient(timeout=90) as c:
@@ -153,33 +158,61 @@ def _spread_by_group(rows: list[dict], limit: int, key=quality) -> list[dict]:
     return out
 
 
+def _located_first(row: dict) -> bool:
+    return row.get("latitude") is not None
+
+
 def shortlist(rows: list[dict], pace: str | None, days: int) -> tuple[list[dict], list[dict]]:
     """Compact candidate set for the model: enough food for 3 meals/day with breakfast-capable
-    venues guaranteed, and activities spread across groups. Pure code, no LLM."""
+    venues guaranteed, and activities spread across groups. Pure code, no LLM.
+
+    Web-research rows carry no rating, so ranking by `quality` alone always put them last and
+    a well-stocked catalogue cut every one of them. Up to a quarter of the food slots and a third
+    of the activity slots are reserved for them (located rows first); the caps are unchanged."""
     cap = capacity(pace, days)
     social = [r for r in rows if r.get("source") == "social"]
     food_all = sorted((r for r in rows if is_food(r)), key=quality, reverse=True)
     social_food = [r for r in social if is_food(r)]
+    food_limit = max(16, cap["meals"] * 3)
+    web_food = sorted((r for r in food_all if r.get("source") == "web"), key=_located_first, reverse=True)
     breakfasty = [r for r in food_all if "breakfast" in (r.get("meals") or []) or _looks_breakfast(r)]
     food, seen = [], set()
-    for r in [*breakfasty[: max(4, days * 2)], *food_all]:
+    for r in [*web_food[: max(2, food_limit // 4)], *breakfasty[: max(4, days * 2)], *food_all]:
         key = row_key(r)
         if key not in seen:
             seen.add(key)
             food.append(r)
-    food_limit = max(16, cap["meals"] * 3)
     food = food[:food_limit]
     # A social row is pinned by the source video and must never be removed by the catalogue cap.
     food = social_food + [r for r in food if r not in social_food]
     acts_limit = max(14, int(cap["activities"] * 3))
     acts = [r for r in social if not is_food(r) and r["placeGroup"] != "ACCOMMODATION"]
-    social_activity_keys = {row_key(r) for r in acts}
-    acts += [r for r in _spread_by_group(
-        [r for r in rows if r.get("source") != "social" and not is_food(r)
-         and r["placeGroup"] != "ACCOMMODATION"],
-        acts_limit,
-    ) if row_key(r) not in social_activity_keys]
+    taken = {row_key(r) for r in acts}
+    pool = [r for r in rows if r.get("source") != "social" and not is_food(r)
+            and r["placeGroup"] != "ACCOMMODATION"]
+    web_acts = _spread_by_group([r for r in pool if r.get("source") == "web"], acts_limit // 3, key=_located_first)
+    web_acts = [r for r in web_acts if row_key(r) not in taken]
+    taken |= {row_key(r) for r in web_acts}
+    rest = [r for r in pool if row_key(r) not in taken]
+    acts += web_acts + _spread_by_group(rest, acts_limit - len(web_acts))
     return food, acts
+
+
+def resolve_refs(ai: Any, refs: dict[str, str]) -> Any:
+    """Map the planner's short refs ("f3") back to row keys so `materialize` sees real ids.
+    Unknown refs are left as they are; `materialize` drops them with a note."""
+    if not isinstance(ai, dict) or not isinstance(ai.get("days"), list):
+        return ai
+    for day in ai["days"]:
+        if not isinstance(day, dict) or not isinstance(day.get("stops"), list):
+            continue
+        for stop in day["stops"]:
+            if not isinstance(stop, dict) or stop.get("rest"):
+                continue
+            ref = str(stop.get("id") or stop.get("candidateId") or stop.get("placeId") or "")
+            if ref in refs:
+                stop["candidateId"] = refs[ref]
+    return ai
 
 
 def _destination_center(destination: dict, rows: list[dict]) -> dict:
@@ -369,15 +402,25 @@ async def build_workflow(job: dict[str, Any], token: str):
                 last_note = f"the traveller moves on to {dests[i + 1].get('name')} afterwards: keep the evening free after dinner"
             system = build_itinerary_prompt(req, locale, d.get("name") or req.get("cityName") or "", len(dates),
                                             day_numbers, weekdays, cfg, first_note, last_note)
+            refs: dict[str, str] = {}
+
+            def compact(group_rows: list[dict], prefix: str) -> list[dict]:
+                out_rows = []
+                for n, r in enumerate(group_rows, start=1):
+                    refs[f"{prefix}{n}"] = row_key(r)
+                    out_rows.append(compact_for_plan(r, weekdays, f"{prefix}{n}"))
+                return out_rows
+
             payload = {
                 "destination": d.get("name") or req.get("cityName") or "",
                 "days": [{"dayNumber": n, "date": x.isoformat(), "weekday": w} for n, x, w in zip(day_numbers, dates, weekdays)],
-                "food": [compact_for_plan(r, weekdays) for r in food],
-                "activities": [compact_for_plan(r, weekdays) for r in acts],
+                "food": compact(food, "f"),
+                "activities": compact(acts, "a"),
             }
-            out = await model.json(system, payload, max_tokens=12000, temperature=0.5, cache=False)
+            out = await model.json(system, payload, max_tokens=12000, temperature=0.5, cache=False,
+                                   operation="PLAN_ITINERARY")
             logger.info("plan %s: food=%d acts=%d days=%d llm=%s", d.get("name"), len(food), len(acts), len(dates), out is not None)
-            return out
+            return resolve_refs(out, refs)
 
         answers = await asyncio.gather(*(ask(i) for i in range(len(dests))))
 
@@ -421,6 +464,7 @@ async def build_workflow(job: dict[str, Any], token: str):
                 locale,
                 max_chars=max_chars,
             )
+            apply_social_texts(dest_items, rows)
             items += dest_items
             first_day_delay = 0
             nxt = next((j for j in range(i + 1, len(dests)) if dest_dates[j]), None)
@@ -437,7 +481,10 @@ async def build_workflow(job: dict[str, Any], token: str):
                     first_day_delay = minutes + 15
                 else:
                     items.append(intercity_transport(d, dests[nxt], last_day, last_end, locale, arrival_day=arrive_day))
-        description = " ".join(dict.fromkeys(descriptions)).strip()[:500] or FALLBACK_DESC[locale]
+        social_context = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else {}
+        description = (social_trip_text(social_context)
+                       or " ".join(dict.fromkeys(descriptions)).strip()[:500]
+                       or FALLBACK_DESC[locale])
         return {"items": items, "description": description}
 
     async def verify(s: State):
@@ -470,6 +517,7 @@ async def build_workflow(job: dict[str, Any], token: str):
 
 async def run_job(job: dict[str, Any], token: str) -> None:
     java = JavaClient(job, token)
+    binding = ai_log.bind(java.ai_call)
     try:
         graph = await build_workflow(job, token)
         await graph.ainvoke({"job": job})
@@ -480,3 +528,5 @@ async def run_job(job: dict[str, Any], token: str) -> None:
         except Exception as report_err:
             logger.error("could not report failure: %s", report_err)
         raise
+    finally:
+        ai_log.unbind(binding)

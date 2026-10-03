@@ -9,7 +9,10 @@ Java owns auth, quota, the job row and SSE; this service only calls back into
 **One LLM call per destination** returns the complete itinerary — which places, which day, what
 time, in what order, rest blocks, and all wording. Code never re-plans. It only:
 
-- prepares a compact, deduplicated candidate shortlist (breakfast-capable venues guaranteed),
+- prepares a compact, deduplicated candidate shortlist (breakfast-capable venues guaranteed, up to
+  a quarter of food slots and a third of activity slots reserved for cited Web rows, which carry
+  no rating and would otherwise always rank last), with short refs (`f3`, `a7`) instead of UUIDs
+  that are mapped back before the answer is used,
 - fetches the editable rules from the `config` table and assembles the prompt,
 - guards the answer against what Java's commit rejects (unknown/duplicate ids, overlapping or
   invalid times, PLACE_VISIT without placeId, over-long strings),
@@ -69,7 +72,7 @@ in sync when editing defaults in code.
 | `AI_TRIP_WEB_CURATION_MAX_PER_GROUP` | Maximum Web candidates sent per group to Java identity resolution (default 12). |
 | `AI_TRIP_CANDIDATES_PER_GROUP` | `/candidates` limit per group (default 120). |
 | `AI_TRIP_LLM_TIMEOUT_SECONDS` | HTTP timeout for the planning call (default 180). |
-| `LOG_LEVEL` | Default INFO. Prompts and payloads are not logged, only their sizes. |
+| `LOG_LEVEL` | Default INFO. Prompts and payloads are not logged, only their sizes and the provider's token `usage` (`LLM usage ...`, `Web research usage ...`). |
 
 ## Multi-destination trips
 
