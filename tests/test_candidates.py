@@ -40,10 +40,10 @@ def test_merge_dedupes_by_id_and_google_id():
 
 def test_shortage_asks_for_food_and_selected_groups_only():
     rows = [normalize({**JAVA_ROW, "id": str(i)}) for i in range(4)]  # 4 food, nothing else
-    need = shortage(rows, "BALANCED", 2, ["CULTURE_AND_HERITAGE"])
+    need = shortage(rows, "BALANCED", 2, ["ATTRACTIONS"])
     assert need[FOOD] == 12 - 4
-    assert need["CULTURE_AND_HERITAGE"] == 15  # ceil(3*2*2.5 / 1)
-    assert "NATURE_AND_OUTDOORS" not in need
+    assert need["ATTRACTIONS"] == 15  # ceil(3*2*2.5 / 1)
+    assert set(need) == {FOOD, "ATTRACTIONS"}
 
 
 def test_research_needs_enriches_even_a_sufficient_catalogue():
@@ -53,8 +53,10 @@ def test_research_needs_enriches_even_a_sufficient_catalogue():
         normalize({**JAVA_ROW, "id": f"culture-{i}", "googlePlaceId": f"culture-google-{i}",
                    "placeGroup": "CULTURE_AND_HERITAGE"}) for i in range(20)
     ]
-    needs = research_needs(rows, "BALANCED", 1, ["CULTURE_AND_HERITAGE"], minimum_per_group=3)
-    assert needs == {FOOD: 3, "CULTURE_AND_HERITAGE": 3}
+    # Legacy culture rows are read as ATTRACTIONS, whose research budget is three groups' worth.
+    assert all(r["placeGroup"] == "ATTRACTIONS" for r in rows[20:])
+    needs = research_needs(rows, "BALANCED", 1, ["ATTRACTIONS"], minimum_per_group=3)
+    assert needs == {FOOD: 3, "ATTRACTIONS": 9}
     assert research_needs(rows, "RELAXED", 1, ["CULTURE_AND_HERITAGE"], minimum_per_group=3)[FOOD] == 2
     assert research_needs(rows, "EAGER", 1, ["CULTURE_AND_HERITAGE"], minimum_per_group=3)[FOOD] == 4
 
@@ -66,3 +68,27 @@ def test_category_and_meal_hints():
     assert meal_hint({"category": "Coffee shop", "title": "Cộng Cà Phê"}) == ["snack"]  # cafe is never breakfast
     assert meal_hint({"category": "Restaurant", "title": "Bún chả Hương Liên"}) == ["breakfast", "lunch"]
     assert meal_hint({"category": "Bar", "title": "Sky bar"}) == ["dinner"]
+
+
+def test_sub_types_decide_the_activity_category_over_the_group():
+    beach = normalize({"id": "b", "title": "Mỹ Khê", "placeGroup": "ATTRACTIONS", "subTypes": ["beach"]})
+    temple = normalize({"id": "t", "title": "Chùa Một Cột", "placeGroup": "ATTRACTIONS", "subTypes": ["HERITAGE", "SPIRITUAL"]})
+    plain = normalize({"id": "p", "title": "Somewhere", "placeGroup": "ATTRACTIONS"})
+    assert beach["subTypes"] == ["BEACH"]
+    assert activity_category(beach) == "beach"
+    assert activity_category(temple) == "spiritual"
+    assert activity_category(plain) == "attraction"
+    assert compact_for_plan(beach, [], "a1")["kinds"] == ["BEACH"]
+    assert "kinds" not in compact_for_plan(plain, [], "a2")
+
+
+def test_legacy_groups_fold_into_attractions_and_sub_types_keep_days_varied():
+    from app.candidates import diversity_key, normalize_group
+    assert normalize_group("NATURE_AND_OUTDOORS") == "ATTRACTIONS"
+    assert normalize_group("OTHER") == "ATTRACTIONS"
+    assert normalize_group("FOOD") == FOOD
+    beach = normalize({"id": "b", "placeGroup": "ATTRACTIONS", "subTypes": ["BEACH"]})
+    temple = normalize({"id": "t", "placeGroup": "CULTURE_AND_HERITAGE", "subTypes": ["SPIRITUAL"]})
+    plain = normalize({"id": "p", "placeGroup": "ATTRACTIONS"})
+    assert temple["placeGroup"] == "ATTRACTIONS"
+    assert {diversity_key(beach), diversity_key(temple), diversity_key(plain)} == {"OUTDOOR", "CULTURE", "ATTRACTIONS"}

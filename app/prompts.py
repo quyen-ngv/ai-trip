@@ -25,10 +25,7 @@ KEY_DESCRIPTION_MAX_CHARS = "DESCRIPTION_MAX_CHARS"
 
 PLACE_GROUPS = {
     "FOOD_AND_DRINK": "restaurants, street food, cafes, local specialties",
-    "CULTURE_AND_HERITAGE": "museums, temples, historical sites, galleries, monuments",
-    "NATURE_AND_OUTDOORS": "parks, beaches, mountains, gardens, viewpoints, waterfalls",
-    "SHOPPING_AND_MARKET": "markets, night markets, shopping streets, craft shops",
-    "ATTRACTIONS": "landmarks, theme parks, entertainment venues, famous spots",
+    "ATTRACTIONS": "sights of every kind: museums, temples, historic sites, parks, beaches, viewpoints, markets, shopping, landmarks, entertainment",
 }
 DIETARY = {
     "vegetarian": "no meat, poultry or seafood", "vegan": "no animal products", "halal": "halal only, no pork, no alcohol",
@@ -151,7 +148,7 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
 {traveller_rules}
 
 ## Input
-JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Each candidate: id (short ref, e.g. "f3"/"a7"), title, group (activities only; every food candidate is a food venue), category, rating, reviews, lat, lng, km (distance from the destination centre), visitMin, menu, hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc, why (editorial reason). source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
+JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Each candidate: id (short ref, e.g. "f3"/"a7"), title, group (activities only; every food candidate is a food venue), category, kinds (curated sub-types such as BEACH, SPIRITUAL, MUSEUM, CAFE, HALAL, VEGETARIAN; trust them over the category text), rating, reviews, lat, lng, km (distance from the destination centre), visitMin, menu, hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc, why (editorial reason). source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
 
 ## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
 {{"tripDescription":"...","days":[{{"dayNumber":1,"stops":[

@@ -14,7 +14,7 @@ from typing import Any, TypedDict
 import httpx
 from langgraph.graph import StateGraph, START, END
 from . import ai_log, config
-from .candidates import (ALL_GROUPS, FOOD, bucket, capacity, compact_for_plan, destination_dates,
+from .candidates import (ALL_GROUPS, FOOD, bucket, diversity_key, group_budget, normalize_group, capacity, compact_for_plan, destination_dates,
                          is_food, merge, normalize, pace_plan, quality, research_needs, row_key)
 from .geo import WEEKDAYS, haversine_km
 from .itinerary import append_missing_social_items, apply_social_texts, materialize, social_trip_text
@@ -148,8 +148,12 @@ def _resolve_dest_dates(dests: list[dict]) -> list[list[date]]:
 
 
 def _spread_by_group(rows: list[dict], limit: int, key=quality) -> list[dict]:
-    """Round-robin over place groups so one dominant group cannot crowd out the others."""
-    groups = {g: sorted(v, key=key, reverse=True) for g, v in bucket(rows).items() if v}
+    """Round-robin over kinds (the group, or the sub-type family for sights) so one dominant
+    kind cannot crowd out the others."""
+    kinds: dict[str, list[dict]] = {}
+    for row in rows:
+        kinds.setdefault(diversity_key(row), []).append(row)
+    groups = {g: sorted(v, key=key, reverse=True) for g, v in kinds.items()}
     out: list[dict] = []
     while len(out) < limit and any(groups.values()):
         for g in list(groups):
@@ -259,7 +263,7 @@ async def build_workflow(job: dict[str, Any], token: str):
     locale = "vi" if (job.get("locale") or "").lower().startswith("vi") else "en"
     dests = req["destinations"]
     pace = req.get("pace") or "BALANCED"
-    selected = [str(g).upper() for g in (req.get("placeGroups") or []) if g]
+    selected = list(dict.fromkeys(normalize_group(g) for g in (req.get("placeGroups") or []) if g))
     query_groups = list(dict.fromkeys([g for g in selected if g in ALL_GROUPS] + [FOOD])) if selected else ALL_GROUPS
     first_start = date.fromisoformat(dests[0]["startDate"])
     total_days = (date.fromisoformat(dests[-1]["endDate"]) - first_start).days + 1
@@ -281,7 +285,7 @@ async def build_workflow(job: dict[str, Any], token: str):
             social_rows = [normalize(r, source="social") for r in (social_context.get("candidates") or [])
                            if isinstance(r, dict)]
             if d.get("latitude") is not None and d.get("longitude") is not None:
-                lists = await asyncio.gather(*(java.candidates(d, [g], config.CANDIDATES_PER_GROUP) for g in query_groups))
+                lists = await asyncio.gather(*(java.candidates(d, [g], min(500, group_budget(g, config.CANDIDATES_PER_GROUP))) for g in query_groups))
                 catalogue_rows = merge(*([normalize(r) for r in lst] for lst in lists))
             else:
                 # An unresolved social destination is still a valid input. The source rows are

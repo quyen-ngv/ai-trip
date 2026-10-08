@@ -28,7 +28,8 @@ class FakeJava:
 
     async def candidates(self, d, groups, limit):
         g = groups[0]
-        n = 14 if g == "FOOD_AND_DRINK" else 8 if g == "CULTURE_AND_HERITAGE" else 0
+        # The job asks for the legacy CULTURE_AND_HERITAGE group; the worker folds it into ATTRACTIONS.
+        n = 14 if g == "FOOD_AND_DRINK" else 8 if g == "ATTRACTIONS" else 0
         return [java_row(i + (0 if g == "FOOD_AND_DRINK" else 100), g) for i in range(n)]
 
     async def commit(self, items, description):
@@ -141,7 +142,7 @@ async def test_graph_researches_the_web_even_when_catalogue_is_sufficient(monkey
     await graph.ainvoke({"job": JOB})
 
     assert RecordingResearcher.calls == [
-        ("Hà Nội", {"FOOD_AND_DRINK": 3, "CULTURE_AND_HERITAGE": 3}, 0),
+        ("Hà Nội", {"FOOD_AND_DRINK": 3, "ATTRACTIONS": 9}, 0),
     ]
 
 

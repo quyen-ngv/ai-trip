@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 
 from . import ai_log, config
-from .candidates import ACTIVITY_GROUPS, FOOD, normalize
+from .candidates import ACTIVITY_GROUPS, ATTRACTIONS, FOOD, LEGACY_ACTIVITY_GROUPS, group_budget, normalize
 from .llm import CachedModel
 from .research_cache import ResearchCache
 
@@ -40,8 +40,9 @@ relaxed family itinerary\", or \"best accessible cultural sights in Hue for seni
 for Google Maps or map results.
 
 Return {\"queries\":[{\"group\": one requested group, \"query\": string}]} with exactly the
-requested count for each group. Allowed groups are FOOD_AND_DRINK, CULTURE_AND_HERITAGE,
-NATURE_AND_OUTDOORS, SHOPPING_AND_MARKET, ATTRACTIONS."""
+requested count for each group. Allowed groups are FOOD_AND_DRINK and ATTRACTIONS (every sight:
+culture, temples, nature, beaches, markets, shopping, landmarks, entertainment); spread the
+ATTRACTIONS queries across those kinds."""
 
 _RESEARCH_INSTRUCTIONS = """You are a travel web-research agent. You MUST use Web Search before
 answering. Search the Web for the supplied query, then read and cross-check at least the requested
@@ -86,13 +87,15 @@ def _normalise_group(value: Any) -> str | None:
         "FOOD": FOOD,
         "RESTAURANTS": FOOD,
         "RESTAURANT": FOOD,
-        "CULTURE": "CULTURE_AND_HERITAGE",
-        "NATURE": "NATURE_AND_OUTDOORS",
-        "SHOPPING": "SHOPPING_AND_MARKET",
-        "ATTRACTION": "ATTRACTIONS",
+        "CULTURE": ATTRACTIONS,
+        "NATURE": ATTRACTIONS,
+        "SHOPPING": ATTRACTIONS,
+        "ATTRACTION": ATTRACTIONS,
         "SPOTS": "ATTRACTIONS",
     }
     text = aliases.get(text, text)
+    if text in LEGACY_ACTIVITY_GROUPS:
+        text = ATTRACTIONS
     return text if text in {FOOD, *ACTIVITY_GROUPS} else None
 
 
@@ -438,7 +441,7 @@ class WebResearcher:
         curated: list[dict] = []
         for row in rows:
             group = str(row.get("placeGroup") or "")
-            if row.get("candidateId") not in ids or per_group.get(group, 0) >= config.WEB_CURATION_MAX_PER_GROUP:
+            if row.get("candidateId") not in ids                     or per_group.get(group, 0) >= group_budget(group, config.WEB_CURATION_MAX_PER_GROUP):
                 continue
             curated.append(row)
             per_group[group] = per_group.get(group, 0) + 1

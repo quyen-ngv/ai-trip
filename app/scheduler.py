@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
-from .candidates import activity_category, is_food, meal_hint, pace_plan, quality, row_key
+from .candidates import activity_category, diversity_key, is_food, meal_hint, pace_plan, quality, row_key
 from .geo import WEEKDAYS, fmt_time, has_coords, haversine_km, intercity_mode, is_open, next_opening, travel_estimate
 
 logger = logging.getLogger(__name__)
@@ -212,9 +212,9 @@ def fill_day(day: DayPlan, food_pool: list[dict], act_pool: list[dict], pace: di
         if have.count(slot) >= slots_cycle.count(slot):
             continue
         at = {"MORNING": 9 * 60 + 30, "AFTERNOON": 14 * 60 + 30, "EVENING": 20 * 60}[slot]
-        # prefer groups not yet represented today
-        present = {s.row["placeGroup"] for s in acts}
-        row = _pick(act_pool, used, anchor, day.weekday, at, pace["visit"], lambda r: r["placeGroup"] not in present) \
+        # prefer kinds not yet represented today
+        present = {diversity_key(s.row) for s in acts}
+        row = _pick(act_pool, used, anchor, day.weekday, at, pace["visit"], lambda r: diversity_key(r) not in present) \
             or _pick(act_pool, used, anchor, day.weekday, at, pace["visit"])
         if not row:
             break

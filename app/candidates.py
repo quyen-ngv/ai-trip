@@ -6,8 +6,51 @@ from typing import Any
 from .geo import hours_summary
 
 FOOD = "FOOD_AND_DRINK"
-ACTIVITY_GROUPS = ["CULTURE_AND_HERITAGE", "NATURE_AND_OUTDOORS", "SHOPPING_AND_MARKET", "ATTRACTIONS"]
+ATTRACTIONS = "ATTRACTIONS"
+ACTIVITY_GROUPS = [ATTRACTIONS]
 ALL_GROUPS = [FOOD] + ACTIVITY_GROUPS
+
+# Activity groups before backend V219 folded them into ATTRACTIONS. Old app requests and stored
+# jobs still carry them; their meaning now lives in the place sub-types.
+LEGACY_ACTIVITY_GROUPS = frozenset({"CULTURE_AND_HERITAGE", "NATURE_AND_OUTDOORS", "SHOPPING_AND_MARKET", "OTHER"})
+
+# ATTRACTIONS does the work the four old activity groups each did, so its per-group budgets
+# (catalogue rows, research queries, curated web rows) are this many times the base.
+ATTRACTIONS_SHARE = 3
+
+# Sub-type families that keep a day varied now that every sight shares one group.
+_KIND_FAMILIES = (
+    ("OUTDOOR", {"NATURE", "BEACH", "PARK", "VIEWPOINT"}),
+    ("CULTURE", {"SPIRITUAL", "MUSEUM", "HERITAGE", "LANDMARK"}),
+    ("SHOPPING", {"SHOPPING", "MARKET"}),
+    ("FUN", {"ENTERTAINMENT", "THEME_PARK"}),
+)
+
+
+def normalize_group(value: Any) -> str:
+    """Current group code for any code the worker may receive, legacy ones included."""
+    group = str(value or "").strip().upper()
+    if not group or group in LEGACY_ACTIVITY_GROUPS:
+        return ATTRACTIONS
+    if group == "FOOD":
+        return FOOD
+    return group
+
+
+def group_budget(group: str, base: int) -> int:
+    return base * ATTRACTIONS_SHARE if group == ATTRACTIONS else base
+
+
+def diversity_key(row: dict) -> str:
+    """What a stop counts as when spreading a day: its group, or for sights the sub-type family."""
+    group = row.get("placeGroup") or ATTRACTIONS
+    if group != ATTRACTIONS:
+        return group
+    kinds = set(row.get("subTypes") or [])
+    for family, members in _KIND_FAMILIES:
+        if kinds & members:
+            return family
+    return ATTRACTIONS
 
 # Stops per full day, excluding the three meals. Windows are minutes from midnight.
 PACE_PLAN = {
@@ -76,9 +119,7 @@ def flatten_attributes(attrs: Any, limit: int = 160) -> str:
 
 def normalize(row: dict, source: str = "db") -> dict:
     """Map a Java `/candidates` row (or a research row) to the worker's internal shape."""
-    group = row.get("placeGroup") or "OTHER"
-    if not isinstance(group, str):
-        group = str(group)
+    group = normalize_group(row.get("placeGroup"))
     menu = row.get("menuHighlights") or []
     if not isinstance(menu, list):
         menu = []
@@ -96,8 +137,9 @@ def normalize(row: dict, source: str = "db") -> dict:
         "address": row.get("address") or "",
         "latitude": _num(row.get("latitude")),
         "longitude": _num(row.get("longitude")),
-        "placeGroup": group.upper(),
+        "placeGroup": group,
         "category": row.get("category") or "",
+        "subTypes": [str(kind).upper() for kind in (row.get("subTypes") or []) if kind],
         "reviewRating": _num(row.get("reviewRating")) or 0.0,
         "reviewCount": int(_num(row.get("reviewCount")) or 0),
         "score": _num(row.get("score")),
@@ -178,7 +220,6 @@ def merge(*lists: list[dict]) -> list[dict]:
 
 def bucket(rows: list[dict]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {g: [] for g in ALL_GROUPS}
-    out["OTHER"] = []
     for r in rows:
         out.setdefault(r["placeGroup"], []).append(r)
     return out
@@ -226,7 +267,7 @@ def research_needs(rows: list[dict], pace: str | None, days: int, selected_group
     selected = [g for g in selected_groups if g in ACTIVITY_GROUPS]
     groups = [FOOD, *(selected or ACTIVITY_GROUPS)]
     missing = shortage(rows, pace, days, selected_groups)
-    return {group: max(minimum, missing.get(group, 0)) for group in dict.fromkeys(groups)}
+    return {group: max(group_budget(group, minimum), missing.get(group, 0)) for group in dict.fromkeys(groups)}
 
 
 def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
@@ -236,6 +277,8 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     out: dict[str, Any] = {"id": ref, "title": r["title"]}
     if not is_food(r):
         out["group"] = r["placeGroup"]
+    if r.get("subTypes"):
+        out["kinds"] = r["subTypes"]
     if r.get("category"):
         out["category"] = r["category"]
     if r.get("fit") is not None:
@@ -286,6 +329,20 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     return out
 
 
+# First match wins: a beach park is a beach, a temple museum is spiritual.
+_SUB_TYPE_CATEGORIES = (
+    ("BEACH", "beach"),
+    ("SPIRITUAL", "spiritual"),
+    ("THEME_PARK", "entertainment"),
+    ("ENTERTAINMENT", "entertainment"),
+    ("NATURE", "nature"),
+    ("PARK", "nature"),
+    ("VIEWPOINT", "nature"),
+    ("SHOPPING", "shopping"),
+    ("MARKET", "shopping"),
+)
+
+
 def activity_category(r: dict) -> str:
     """Map a place to one of the categories the Flutter app is willing to store."""
     g = r.get("placeGroup") or ""
@@ -294,6 +351,11 @@ def activity_category(r: dict) -> str:
         return "restaurant"
     if g == "ACCOMMODATION":
         return "hotel"
+    # Catalogue sub-types are curated, so they win over the group and the keyword guesses below.
+    kinds = set(r.get("subTypes") or [])
+    for kind, category in _SUB_TYPE_CATEGORIES:
+        if kind in kinds:
+            return category
     if g == "SHOPPING_AND_MARKET":
         return "shopping"
     if g == "NATURE_AND_OUTDOORS":
