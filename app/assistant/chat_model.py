@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 PREFIXES = ("ASSISTANT_LLM", "QUALITY_LLM", "CHEAP_LLM")
 TIMEOUT_SECONDS = float(os.getenv("ASSISTANT_LLM_TIMEOUT_SECONDS", "60") or 60)
+# Reasoning models (gpt-5.x) reject function tools on /chat/completions unless reasoning is off.
+# Models seen rejecting it are remembered so later turns send "none" up front.
+_NO_REASONING_MODELS: set[str] = set()
 
 
 def _configured(prefix: str) -> bool:
@@ -52,6 +55,8 @@ class ChatModel:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+            if self.model in _NO_REASONING_MODELS:
+                body["reasoning_effort"] = "none"
         if cache_key and "openai.com" in self.url:
             body["prompt_cache_key"] = cache_key
         started = time.monotonic()
@@ -76,7 +81,10 @@ class ChatModel:
                     if response.status_code != 400:
                         break
                     error = response.text.lower()
-                    if "max_tokens" in error and "max_tokens" in body:
+                    if "reasoning_effort" in error and body.get("reasoning_effort") != "none":
+                        body["reasoning_effort"] = "none"
+                        _NO_REASONING_MODELS.add(body["model"])
+                    elif "max_tokens" in error and "max_tokens" in body:
                         body["max_completion_tokens"] = body.pop("max_tokens")
                     elif "temperature" in error and "temperature" in body:
                         body = {k: v for k, v in body.items() if k != "temperature"}

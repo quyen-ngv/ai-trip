@@ -149,3 +149,38 @@ def test_direct_chat_gets_trip_tools_and_names_resolve():
                   names, places)
     assert places == {PLACE} and names["t9"] == "Huế"
     assert step_for("get_trip", {"trip_id": "t9"}, names) == ("trip_details", {"name": "Huế"})
+
+
+@pytest.mark.asyncio
+async def test_reasoning_model_with_tools_retries_with_reasoning_off(monkeypatch):
+    import httpx
+    from app.assistant import chat_model
+
+    sent = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        if body.get("reasoning_effort") != "none":
+            return httpx.Response(400, json={"error": {"message": "Function tools with reasoning_effort are not "
+                                                                  "supported. Set reasoning_effort to 'none'."}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(chat_model.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(chat_model, "_NO_REASONING_MODELS", set())
+    monkeypatch.setattr(chat_model.ai_log, "report", lambda **kw: _noop())
+    for key, value in {"BASE_URL": "https://llm.test/v1", "API_KEY": "k", "MODEL": "gpt-test"}.items():
+        monkeypatch.setenv(f"ASSISTANT_LLM_{key}", value)
+    tools = [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}]
+
+    first = await chat_model.ChatModel().complete([{"role": "user", "content": "hi"}], tools)
+    second = await chat_model.ChatModel().complete([{"role": "user", "content": "hi"}], tools)
+
+    assert first["content"] == "ok" and second["content"] == "ok"
+    assert [b.get("reasoning_effort") for b in sent] == [None, "none", "none"]
+
+
+async def _noop():
+    return None
