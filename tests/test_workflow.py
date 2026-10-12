@@ -69,7 +69,7 @@ class NoopWebResearcher:
     def __init__(self, **kwargs):
         self.enabled = True
 
-    async def research_destination(self, destination, needs, known):
+    async def research_destination(self, destination, needs, known, timeout=None):
         return []
 
 
@@ -94,7 +94,9 @@ async def test_graph_end_to_end(monkeypatch):
     visits = [i for i in items if i["type"] == "PLACE_VISIT"]
     assert {i["dayNumber"] for i in visits} == {1, 2}
     assert all(i["placeId"] and i["name"].startswith(("Quán", "Điểm")) for i in visits)   # DB titles, valid ids
-    assert all(i["description"].startswith("Ghé") for i in visits)                       # notes keyed by placeId landed
+    # time-to-spend estimate first, then the planner's guide
+    assert all(i["description"].startswith("⏱ Nên dành") for i in visits)
+    assert all(i["description"].split("\n", 1)[1].startswith("Ghé") for i in visits)  # notes keyed by placeId landed
     assert not any(i["type"] == "TRANSPORT" for i in items)  # all stops within ~2 km: no in-city transport rows
     assert all(not any(k.startswith("_") for k in i) for i in items)
     # Java validateItems: sortOrder sequential, no overlap per day
@@ -109,7 +111,10 @@ async def test_graph_end_to_end(monkeypatch):
     for needle in ("HIDDEN_GEMS", "Couple", "Elderly-friendly", "no_pork", "muốn ăn phở", "Vietnamese", "Hà Nội"):
         assert needle.lower() in system.lower(), needle
     payload = fake_llm.calls[0][1]
-    assert all(p["title"] for p in payload["food"]) and any(p.get("menu") for p in payload["food"])
+    assert all(p["title"] for p in payload["food"]) and all(p.get("address") for p in payload["food"])
+    # dishes now reach the planner (the food-lover rule names them); distance and group stay out
+    assert not any("km" in p or "group" in p for p in payload["food"])
+    assert all(isinstance(p.get("menu", []), list) and len(p.get("menu", [])) <= 6 for p in payload["food"])
     rest = [i for i in items if i["name"] == "Nghỉ ngơi tại khách sạn"]
     assert rest and rest[0]["type"] == "ACTIVITY"
     assert fake_java.events[-1][0] == "SAVING"
@@ -123,7 +128,7 @@ async def test_graph_researches_the_web_even_when_catalogue_is_sufficient(monkey
         def __init__(self, **kwargs):
             self.enabled = True
 
-        async def research_destination(self, destination, needs, known):
+        async def research_destination(self, destination, needs, known, timeout=None):
             self.calls.append((destination["name"], needs, len(known)))
             return []
 

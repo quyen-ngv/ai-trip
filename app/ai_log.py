@@ -13,10 +13,13 @@ logger = logging.getLogger(__name__)
 
 Sink = Callable[[dict[str, Any]], Awaitable[None]]
 _sink: ContextVar[Sink | None] = ContextVar("ai_call_sink", default=None)
+_feature: ContextVar[str] = ContextVar("ai_call_feature", default="AI_TRIP")
 
 
-def bind(sink: Sink | None):
-    """Route this context's reports (and tasks created from it) to `sink`."""
+def bind(sink: Sink | None, feature: str = "AI_TRIP"):
+    """Route this context's reports (and tasks created from it) to `sink`, labelled `feature`
+    (AI_TRIP for trip planning, ASSISTANT for Pengoo's chat turns)."""
+    _feature.set(feature)
     return _sink.set(sink)
 
 
@@ -58,7 +61,7 @@ async def report(*, operation: str, provider: str, model: str, ok: bool, request
     if sink is None:
         return
     entry = {
-        "feature": "AI_TRIP", "operation": operation, "correlationId": str(uuid.uuid4()),
+        "feature": _feature.get(), "operation": operation, "correlationId": str(uuid.uuid4()),
         "provider": provider, "model": model, "status": "SUCCEEDED" if ok else "FAILED",
         "request": request, "response": response, "error": error,
         "inputTokens": input_tokens, "cachedInputTokens": cached_input_tokens, "outputTokens": output_tokens,

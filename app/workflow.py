@@ -17,7 +17,8 @@ from . import ai_log, config
 from .candidates import (ALL_GROUPS, FOOD, bucket, diversity_key, group_budget, normalize_group, capacity, compact_for_plan, destination_dates,
                          is_food, merge, normalize, pace_plan, quality, research_needs, row_key)
 from .geo import WEEKDAYS, haversine_km
-from .itinerary import append_missing_social_items, apply_social_texts, materialize, social_trip_text
+from .itinerary import (add_time_estimates, append_missing_social_items, apply_social_texts, materialize,
+                        social_trip_text)
 from .llm import CachedModel
 from .prompts import (CONFIG_LABEL, DEFAULT_DESCRIPTION_MAX_CHARS, KEY_DESCRIPTION_MAX_CHARS, build_itinerary_prompt)
 from .research import WebResearcher
@@ -70,7 +71,9 @@ class JavaClient:
             return {}
 
     async def candidates(self, d: dict, groups: list[str], limit: int) -> list[dict]:
-        body = {"latitude": d["latitude"], "longitude": d["longitude"], "placeGroups": groups, "limit": limit}
+        # locationImageId pins the search to the destination's tourist area (Da Nang without Hoi An).
+        body = {"latitude": d["latitude"], "longitude": d["longitude"], "placeGroups": groups, "limit": limit,
+                "locationImageId": d.get("locationImageId")}
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(self.root + "/candidates", headers=self.headers, json=body)
             r.raise_for_status()
@@ -80,7 +83,7 @@ class JavaClient:
         if not candidates:
             return []
         body = {
-            "latitude": d["latitude"], "longitude": d["longitude"],
+            "latitude": d["latitude"], "longitude": d["longitude"], "locationImageId": d.get("locationImageId"),
             "candidates": [{
                 "candidateId": row.get("candidateId"), "title": row.get("title"),
                 "placeGroup": row.get("placeGroup"),
@@ -244,6 +247,35 @@ def _research_destination_input(destination: dict, fallback_name: str | None = N
     return out
 
 
+def candidate_limit(group: str, pace: str | None, days: int) -> int:
+    """Catalogue rows to fetch for one group of one destination.
+
+    The shortlist grows with the trip (9 food rows a day, 3 per planned stop), so the fetch
+    does too: the configured base covers a short trip, and a long one gets about four times
+    what its shortlist keeps, capped at what the Java endpoint accepts."""
+    cap = capacity(pace, max(1, days))
+    need = max(16, cap["meals"] * 3) if group == FOOD else max(14, int(cap["activities"] * 3))
+    return min(500, max(group_budget(group, config.CANDIDATES_PER_GROUP), need * 4))
+
+
+def description_chars(configured: int, days: int) -> int:
+    """Per-stop guide length for one destination. Every stop of every day is written in one model
+    call, so a long stay gets shorter guides rather than an answer cut off at the token limit."""
+    budget = 600 if days <= 7 else 450 if days <= 12 else 320
+    return max(80, min(configured, budget))
+
+
+def plan_max_tokens(days: int, chars: int) -> int:
+    """About 8 stops a day, each ~chars/2.5 tokens of text plus ~30 of JSON, on top of a fixed part."""
+    per_day = 8 * (int(chars / 2.5) + 30)
+    return max(12000, min(32000, 3000 + per_day * days))
+
+
+def plan_timeout_seconds(days: int) -> int:
+    """Long answers take longer to generate: two minutes plus 25 seconds a day, at most ten."""
+    return min(600, 120 + 25 * days)
+
+
 def _looks_breakfast(r: dict) -> bool:
     from .candidates import meal_hint
     return "breakfast" in meal_hint(r)
@@ -280,12 +312,13 @@ async def build_workflow(job: dict[str, Any], token: str):
     async def retrieve(s: State):
         await java.event("RETRIEVING", 15, "ai_trip.retrieving")
 
-        async def one(d: dict) -> list[dict]:
+        async def one(i: int, d: dict) -> list[dict]:
             social_context = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else {}
             social_rows = [normalize(r, source="social") for r in (social_context.get("candidates") or [])
                            if isinstance(r, dict)]
             if d.get("latitude") is not None and d.get("longitude") is not None:
-                lists = await asyncio.gather(*(java.candidates(d, [g], min(500, group_budget(g, config.CANDIDATES_PER_GROUP))) for g in query_groups))
+                days = len(dest_dates[i]) or 1
+                lists = await asyncio.gather(*(java.candidates(d, [g], candidate_limit(g, pace, days)) for g in query_groups))
                 catalogue_rows = merge(*([normalize(r) for r in lst] for lst in lists))
             else:
                 # An unresolved social destination is still a valid input. The source rows are
@@ -295,7 +328,7 @@ async def build_workflow(job: dict[str, Any], token: str):
             logger.info("retrieve %s: %s", d.get("name"), {g: len(v) for g, v in bucket(rows).items() if v})
             return rows
 
-        return {"inventories": list(await asyncio.gather(*(one(d) for d in dests)))}
+        return {"inventories": list(await asyncio.gather(*(one(i, d) for i, d in enumerate(dests))))}
 
     async def web_research(s: State):
         inventories = list(s["inventories"])
@@ -337,7 +370,10 @@ async def build_workflow(job: dict[str, Any], token: str):
             try:
                 # Search is independent of the local catalogue: an existing title still needs
                 # citation evidence and Java will later resolve the identity in one controlled step.
-                rows = await asyncio.wait_for(researcher.research_destination(d, needs, []), timeout=budget)
+                # The researcher stops at `budget` itself and keeps what it found; the outer cap
+                # only guards against query planning hanging.
+                rows = await asyncio.wait_for(researcher.research_destination(d, needs, [], timeout=budget),
+                                              timeout=budget + 30)
             except TimeoutError as exc:
                 raise RuntimeError(f"AI Web research timed out for {d.get('name') or 'destination'}") from exc
             remaining -= time.monotonic() - started
@@ -368,8 +404,13 @@ async def build_workflow(job: dict[str, Any], token: str):
             resolved = await java.resolve_candidates(dests[i], rows)
             by_id = {str(row.get("candidateId")): row for row in resolved if isinstance(row, dict) and row.get("candidateId")}
             enriched: list[dict] = []
+            dropped = 0
             for raw in rows:
                 result = by_id.get(str(raw.get("candidateId")))
+                if result and result.get("resolutionStatus") == "OUT_OF_AREA":
+                    # Resolved into another tourist area (Hoi An for a Da Nang trip): not this destination.
+                    dropped += 1
+                    continue
                 if result:
                     # Keep the Web rationale/citations from Python; trust only identity/location
                     # fields returned by Java's exact DB/Goong resolver.
@@ -381,7 +422,8 @@ async def build_workflow(job: dict[str, Any], token: str):
             # Resolved candidates go first so their cited context is retained when they equal a
             # catalogue place already returned by `retrieve`.
             inventories[i] = merge(enriched, inventories[i])
-            logger.info("resolve %s: %d candidates", dests[i].get("name"), len(enriched))
+            logger.info("resolve %s: %d candidates, %d outside the destination area", dests[i].get("name"),
+                        len(enriched), dropped)
         return {"inventories": inventories}
 
     async def plan(s: State):
@@ -393,6 +435,7 @@ async def build_workflow(job: dict[str, Any], token: str):
             d, rows, dates = dests[i], s["inventories"][i], dest_dates[i]
             if not dates or not rows:
                 return None
+            chars = description_chars(max_chars, len(dates))
             day_numbers = [_day_number(first_start, x) for x in dates]
             weekdays = [WEEKDAYS[x.weekday()] for x in dates]
             food, acts = shortlist(rows, pace, len(dates))
@@ -405,7 +448,8 @@ async def build_workflow(job: dict[str, Any], token: str):
             if i + 1 < len(dests) and dest_dates[i + 1]:
                 last_note = f"the traveller moves on to {dests[i + 1].get('name')} afterwards: keep the evening free after dinner"
             system = build_itinerary_prompt(req, locale, d.get("name") or req.get("cityName") or "", len(dates),
-                                            day_numbers, weekdays, cfg, first_note, last_note)
+                                            day_numbers, weekdays, {**cfg, KEY_DESCRIPTION_MAX_CHARS: str(chars)},
+                                            first_note, last_note)
             refs: dict[str, str] = {}
 
             def compact(group_rows: list[dict], prefix: str) -> list[dict]:
@@ -421,8 +465,11 @@ async def build_workflow(job: dict[str, Any], token: str):
                 "food": compact(food, "f"),
                 "activities": compact(acts, "a"),
             }
-            out = await model.json(system, payload, max_tokens=12000, temperature=0.5, cache=False,
-                                   operation="PLAN_ITINERARY")
+            # Output grows with the number of days (every stop has a description); a fixed cap cut
+            # long trips off and sent them to the code-only fallback.
+            out = await model.json(system, payload, max_tokens=plan_max_tokens(len(dates), chars),
+                                   temperature=0.5, cache=False, operation="PLAN_ITINERARY",
+                                   cache_key="ai-trip-plan", timeout=plan_timeout_seconds(len(dates)))
             logger.info("plan %s: food=%d acts=%d days=%d llm=%s", d.get("name"), len(food), len(acts), len(dates), out is not None)
             return resolve_refs(out, refs)
 
@@ -443,7 +490,8 @@ async def build_workflow(job: dict[str, Any], token: str):
             first_start_min = pace_start_minutes + first_day_delay if first_day_delay else None
             try:
                 dest_items, desc, notes = materialize(ai, rows, day_numbers, dates, pace, locale, used,
-                                                      max_chars=max_chars, first_day_start=first_start_min)
+                                                      max_chars=description_chars(max_chars, len(dates)),
+                                                      first_day_start=first_start_min)
                 if desc:
                     descriptions.append(desc)
             except ValueError as e:
@@ -469,6 +517,7 @@ async def build_workflow(job: dict[str, Any], token: str):
                 max_chars=max_chars,
             )
             apply_social_texts(dest_items, rows)
+            add_time_estimates(dest_items, locale)
             items += dest_items
             first_day_delay = 0
             nxt = next((j for j in range(i + 1, len(dests)) if dest_dates[j]), None)

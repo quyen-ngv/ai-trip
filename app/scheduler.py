@@ -380,10 +380,12 @@ def _visit_item(stop: Stop, day: int, locale: str) -> dict:
         "_slot": stop.slot,
         "_placeKey": row_key(r),
     }
+    if r.get("placeGroup") == "REST":
+        item["_rest"] = True
     if r.get("id"):
         item["placeId"] = r["id"]
     elif r.get("externalResolutionVerified"):
-        item["externalPlaceResolution"] = "GOONG"
+        item["externalPlaceResolution"] = r.get("resolvedBy") or "GOONG"
     if r.get("candidateId"):
         item["candidateId"] = r["candidateId"]
     if r.get("source") == "web" and not r.get("id") and not r.get("externalResolutionVerified"):

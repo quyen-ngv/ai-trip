@@ -100,30 +100,15 @@ def _num(v: Any) -> float | None:
         return None
 
 
-def flatten_attributes(attrs: Any, limit: int = 160) -> str:
-    if not isinstance(attrs, dict):
-        return ""
-    parts = []
-    for k, v in attrs.items():
-        if isinstance(v, dict) and "value" in v:
-            v = v["value"]
-        if isinstance(v, bool):
-            if v:
-                parts.append(str(k))
-        elif isinstance(v, (str, int, float)) and str(v).strip():
-            parts.append(f"{k}={v}")
-        elif isinstance(v, list) and v:
-            parts.append(f"{k}={','.join(str(x) for x in v[:4])}")
-    return ", ".join(parts)[:limit]
-
-
 def normalize(row: dict, source: str = "db") -> dict:
     """Map a Java `/candidates` row (or a research row) to the worker's internal shape."""
     group = normalize_group(row.get("placeGroup"))
     menu = row.get("menuHighlights") or []
     if not isinstance(menu, list):
         menu = []
-    desc = (row.get("description") or "").strip()
+    # Catalogue rows carry only the AI description; Web and social rows put their own text in
+    # `description`.
+    desc = (row.get("aiDescription") or row.get("description") or "").strip()
     # A social row's description and tips are the only record of what the video says about the
     # stop, and they become the activity's text, so they are kept whole.
     desc_limit = 1200 if source == "social" else 300
@@ -152,8 +137,9 @@ def normalize(row: dict, source: str = "db") -> dict:
                        if isinstance(url, str) and url.strip()][:3],
         "sourceTitles": [str(title)[:180] for title in (row.get("sourceTitles") or [])
                          if isinstance(title, str) and title.strip()][:3],
-        "attributes": flatten_attributes(row.get("attributes")),
         "menuHighlights": [str(m)[:40] for m in menu[:8]],
+        "price": str(row.get("priceRange") or "").strip()[:16] or None,
+        "tags": [str(tag)[:24] for tag in (row.get("tags") or []) if isinstance(tag, str) and tag.strip()][:12],
         "openHours": row.get("openHours") if isinstance(row.get("openHours"), dict) else None,
         "source": source,
         "socialJobId": str(row.get("socialJobId")) if row.get("socialJobId") else None,
@@ -270,23 +256,42 @@ def research_needs(rows: list[dict], pace: str | None, days: int, selected_group
     return {group: max(group_budget(group, minimum), missing.get(group, 0)) for group in dict.fromkeys(groups)}
 
 
+_COUNTRY_SUFFIX = re.compile(r",?\s*(vietnam|việt nam|viet nam)\s*$", re.I)
+_POSTCODE = re.compile(r"\b\d{5,6}\b")
+
+
+def short_address(address: str, limit: int = 60) -> str:
+    """Street and the first area part only ("61 Đinh Tiên Hoàng, Hoàn Kiếm"). The province,
+    country and postcode repeat on every row of one destination, and lat/lng carry the geography."""
+    text = _POSTCODE.sub("", _COUNTRY_SUFFIX.sub("", (address or "").strip()))
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    return ", ".join(parts[:2])[:limit]
+
+
 def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     """One candidate as the planner sees it. `ref` is a short alias ("f12", "a3") that the
     caller maps back to `row_key`: a UUID costs ~20 tokens on the way in and again in every
-    output stop, and short refs are copied back more reliably."""
+    output stop, and short refs are copied back more reliably.
+
+    Content is name, a short address, opening hours and description (the AI description for a
+    catalogue place, the cited reason for a Web one). The rest is what planning cannot do
+    without: kind (meals vs sights, variety), location (routing), rating and review count
+    (famous vs hidden gems), visit length, and the listing facts the profile rules depend on:
+    price band, tags (breakfast, kids, wheelchair, veg, halal...) and, for food, signature dishes."""
     out: dict[str, Any] = {"id": ref, "title": r["title"]}
-    if not is_food(r):
-        out["group"] = r["placeGroup"]
+    address = short_address(r.get("address") or "")
+    if address:
+        out["address"] = address
+    hours = hours_summary(r.get("openHours"), weekdays)
+    if hours:
+        out["hours"] = hours[:200]
+    if r.get("description"):
+        out["desc"] = r["description"][:160]
     if r.get("subTypes"):
         out["kinds"] = r["subTypes"]
-    if r.get("category"):
+    elif r.get("category"):
+        # Web rows have no curated sub-types; their category is the only type signal.
         out["category"] = r["category"]
-    if r.get("fit") is not None:
-        out["fit"] = r["fit"]
-    if r.get("why"):
-        out["why"] = r["why"][:120]
-    if r.get("meals"):
-        out["meals"] = r["meals"]
     if r.get("reviewRating"):
         out["rating"] = round(r["reviewRating"], 1)
     if r.get("reviewCount"):
@@ -294,17 +299,14 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     if r.get("latitude") is not None:
         out["lat"] = round(r["latitude"], 4)
         out["lng"] = round(r["longitude"], 4)
-    if r.get("distanceKm") is not None:
-        out["km"] = round(r["distanceKm"], 1)
     if r.get("visitDurationMinutes"):
         out["visitMin"] = r["visitDurationMinutes"]
-    if r.get("menuHighlights"):
-        out["menu"] = r["menuHighlights"][:5]
-    if r.get("description"):
-        out["desc"] = r["description"][:120]
-    hours = hours_summary(r.get("openHours"), weekdays)
-    if hours:
-        out["hours"] = hours[:200]
+    if r.get("price"):
+        out["price"] = r["price"]
+    if r.get("tags"):
+        out["tags"] = r["tags"]
+    if is_food(r) and r.get("menuHighlights"):
+        out["menu"] = r["menuHighlights"][:6]
     if r.get("source") == "web":
         # Citations stay on the row and reach the activity notes in code; the planner only
         # needs to know the stop is editorially recommended and whether it has a location.
@@ -368,7 +370,11 @@ def activity_category(r: dict) -> str:
 
 
 def meal_hint(r: dict) -> list[str]:
-    """Which meals a food venue plausibly serves, from its category when the LLM gave none."""
+    """Which meals a food venue plausibly serves: the listing's own meal tags when it has any,
+    otherwise a guess from its category, name and dishes."""
+    listed = [meal for meal in ("breakfast", "lunch", "dinner") if meal in (r.get("tags") or [])]
+    if listed:
+        return listed
     text = f"{r.get('category', '')} {r.get('title', '')} {' '.join(r.get('menuHighlights') or [])}".lower()
     if _BAR.search(text):
         return ["dinner"]

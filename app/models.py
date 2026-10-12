@@ -11,6 +11,21 @@ class StartJob(BaseModel):
     callbackBaseUrl: str = Field(validation_alias=AliasChoices(
         "callbackBaseUrl", "callback_base_url", "callbackUrl", "callback_url"))
 
+class StartTurn(BaseModel):
+    """One question to Pengoo, sent by Java (AssistantContextBuilder)."""
+    model_config = ConfigDict(extra="allow")
+    turnId: str
+    conversationId: str
+    conversationType: str = "TRIP"
+    locale: str = "vi"
+    user: dict[str, Any] = Field(default_factory=dict)
+    trip: dict[str, Any] | None = None
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    question: str = ""
+    callbackBaseUrl: str
+    limits: dict[str, Any] = Field(default_factory=dict)
+    logPayloads: bool = True
+
 class CandidateQuery(BaseModel):
     latitude: float
     longitude: float

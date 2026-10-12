@@ -46,11 +46,101 @@ def _slot_of(row: dict, start: int) -> str:
 
 
 class _Stop:
-    __slots__ = ("row", "start", "end", "description", "slot")
+    __slots__ = ("row", "start", "end", "description", "slot", "stay")
 
-    def __init__(self, row: dict, start: int, end: int, description: str):
+    def __init__(self, row: dict, start: int, end: int, description: str,
+                 stay: tuple[int, int] | None = None):
         self.row, self.start, self.end, self.description = row, start, end, description
         self.slot = _slot_of(row, start)
+        self.stay = stay
+
+
+def parse_stay(value: Any) -> tuple[int, int] | None:
+    """The planner's time-to-spend estimate: [min, max] minutes, a single number, or "60-90".
+    Nonsense (non-numbers, zero, more than ten hours) is ignored rather than guessed at."""
+    numbers: list[float] = []
+    if isinstance(value, (int, float)):
+        numbers = [float(value)]
+    elif isinstance(value, (list, tuple)):
+        for part in value[:2]:
+            try:
+                numbers.append(float(part))
+            except (TypeError, ValueError):
+                return None
+    elif isinstance(value, str):
+        numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", value)[:2]]
+    if not numbers:
+        return None
+    lo, hi = int(round(min(numbers))), int(round(max(numbers)))
+    if lo < 5 or hi > 600:
+        return None
+    return lo, hi
+
+
+def fit_text(text: str, max_chars: int) -> str:
+    """Shortens to `max_chars` at the last sentence or line end when one is close enough, else at
+    a word, with an ellipsis; never mid-word when it can be helped."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1]
+    ends = [cut.rfind(mark) for mark in (". ", "! ", "? ", "\n")]
+    best = max(ends)
+    if best >= int(max_chars * 0.6):
+        return cut[: best + 1].rstrip()
+    space = cut.rfind(" ")
+    return (cut[:space] if space >= int(max_chars * 0.6) else cut).rstrip(" ,;:-") + "…"
+
+
+def _round_minutes(minutes: int) -> int:
+    return max(5, int(round(minutes / 5.0)) * 5) if minutes < 60 else int(round(minutes / 30.0)) * 30
+
+
+def _hours(minutes: int, locale: str) -> str:
+    value = minutes / 60.0
+    text = f"{value:.1f}".rstrip("0").rstrip(".")
+    return text.replace(".", ",") if locale.startswith("vi") else text
+
+
+def stay_label(lo: int, hi: int, locale: str) -> str:
+    """"Nên dành 45–60 phút" / "Plan for 1.5–2 h": what the traveller should budget there."""
+    vi = locale.startswith("vi")
+    lo, hi = _round_minutes(lo), _round_minutes(hi)
+    if hi <= 60:
+        span = f"{lo}–{hi}" if lo != hi else f"{lo}"
+        amount = f"{span} {'phút' if vi else 'min'}"
+    elif lo >= 60:
+        span = f"{_hours(lo, locale)}–{_hours(hi, locale)}" if lo != hi else _hours(lo, locale)
+        amount = f"{span} {'giờ' if vi else 'h'}"
+    else:
+        amount = f"{lo} {'phút' if vi else 'min'}–{_hours(hi, locale)} {'giờ' if vi else 'h'}"
+    return f"⏱ {'Nên dành' if vi else 'Plan for'} {amount}"
+
+
+def add_time_estimates(items: list[dict], locale: str) -> None:
+    """Puts the time-to-spend estimate first in every place stop's description: the planner's own
+    range when it gave one, else the planned slot. Transport items and rest blocks have none
+    (their time is the slot itself)."""
+    for item in items:
+        if item.get("type") == "TRANSPORT" or item.get("_rest"):
+            continue
+        stay = item.get("_stay")
+        if not stay:
+            minutes = _slot_minutes(item)
+            if minutes is None:
+                continue
+            stay = (minutes, minutes)
+        label = stay_label(stay[0], stay[1], locale)
+        body = (item.get("description") or "").strip()
+        item["description"] = f"{label}\n{body}" if body else label
+
+
+def _slot_minutes(item: dict) -> int | None:
+    start, end = _parse_time(item.get("startTime")), _parse_time(item.get("endTime"))
+    if start is None or end is None or item.get("endDayNumber"):
+        return None
+    minutes = end - start
+    return minutes if 5 <= minutes <= 600 else None
 
 
 def _fix_overlaps(stops: list[_Stop], pace: dict) -> list[str]:
@@ -144,13 +234,15 @@ def _item(stop: _Stop, day: int, locale: str, max_chars: int) -> dict:
         "address": (r.get("address") or None) if location_is_verified else None,
         "latitude": r.get("latitude") if location_is_verified else None,
         "longitude": r.get("longitude") if location_is_verified else None,
-        "description": (stop.description or "")[:max_chars] or None,
+        "description": fit_text(stop.description or "", max_chars) or None,
         "_slot": stop.slot, "_placeKey": row_key(r),
+        "_stay": stop.stay,
+        "_rest": r.get("placeGroup") == "REST" or None,
     }
     if r.get("id"):
         item["placeId"] = r["id"]
     elif r.get("externalResolutionVerified"):
-        item["externalPlaceResolution"] = "GOONG"
+        item["externalPlaceResolution"] = r.get("resolvedBy") or "GOONG"
     if r.get("candidateId"):
         item["candidateId"] = r["candidateId"]
     if r.get("source") == "web" and not r.get("id") and not r.get("externalResolutionVerified"):
@@ -241,7 +333,8 @@ def materialize(ai: Any, rows: list[dict], day_numbers: list[int], dates: list[d
                 start = cursor
             if end is None or end <= start:
                 end = start + _default_minutes(row, pace)
-            stops.append(_Stop(row, start, end, str(s.get("description") or "")))
+            stops.append(_Stop(row, start, end, str(s.get("description") or ""),
+                               None if rest in REST_KINDS else parse_stay(s.get("stay"))))
             cursor = end + 15
         if first_day_start and idx == 0:
             for s in stops:

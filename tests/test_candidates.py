@@ -5,9 +5,9 @@ JAVA_ROW = {  # exact shape of AiTripGenerationService.candidates()
     "id": "9c1c0b2e-0000-4000-8000-000000000001", "googlePlaceId": "ChIJabc", "title": "Phở Thìn Bờ Hồ",
     "address": "61 Đinh Tiên Hoàng", "latitude": 21.0301, "longitude": 105.8525, "placeGroup": "FOOD_AND_DRINK",
     "category": "Pho restaurant", "reviewCount": 2345, "reviewRating": 4.3, "score": 7.9, "distanceKm": 0.4,
-    "visitDurationMinutes": None, "description": "  Famous   pho since 1955 " + "x" * 400,
-    "attributes": {"servesBreakfast": {"value": True}, "wheelchair": False, "priceLevel": "$"},
+    "visitDurationMinutes": None, "aiDescription": "  Famous   pho since 1955 " + "x" * 400,
     "menuHighlights": ["Phở tái", "Phở chín"], "openHours": {"Monday": ["6 AM–9 PM"]},
+    "priceRange": "50k-100k₫", "tags": ["breakfast", "lunch", "kids"],
 }
 
 
@@ -17,12 +17,31 @@ def test_normalize_reads_java_field_names():
     assert r["reviewRating"] == 4.3 and r["reviewCount"] == 2345 and r["score"] == 7.9
     assert r["menuHighlights"] == ["Phở tái", "Phở chín"]
     assert len(r["description"]) <= 300 and "  " not in r["description"]
-    assert "servesBreakfast" in r["attributes"] and "wheelchair" not in r["attributes"]
     assert r["openHours"] == {"Monday": ["6 AM–9 PM"]}
     c = compact_for_plan(r, ["Monday"], "f1")
-    assert c["title"] == "Phở Thìn Bờ Hồ" and c["rating"] == 4.3 and c["reviews"] == 2345 and c["menu"]
+    assert c["title"] == "Phở Thìn Bờ Hồ" and c["rating"] == 4.3 and c["reviews"] == 2345
     assert c["id"] == "f1" and "candidateId" not in c and "placeId" not in c and "group" not in c
-    assert c["hours"] == "daily 06:00-21:00" and c["km"] == 0.4
+    assert c["hours"] == "daily 06:00-21:00" and c["address"] == "61 Đinh Tiên Hoàng"
+    assert c["desc"].startswith("Famous pho since 1955") and len(c["desc"]) == 160
+    # listing facts the profile rules depend on
+    assert c["price"] == "50k-100k₫" and c["tags"] == ["breakfast", "lunch", "kids"]
+    assert c["menu"] == ["Phở tái", "Phở chín"]
+    # only what planning needs: no distance, raw attributes or group (every food row is food)
+    assert not {"km", "attributes", "why", "group"} & c.keys()
+
+
+def test_short_address_drops_country_postcode_and_province():
+    from app.candidates import short_address
+    assert short_address("12 Bạch Đằng, Hải Châu, Đà Nẵng 550000, Vietnam") == "12 Bạch Đằng, Hải Châu"
+    assert short_address("61 Đinh Tiên Hoàng") == "61 Đinh Tiên Hoàng"
+    assert short_address("") == ""
+
+
+def test_meal_tags_beat_name_guessing():
+    tagged = normalize({**JAVA_ROW, "title": "Cafe Sáng", "category": "Cafe", "tags": ["breakfast"]})
+    assert meal_hint(tagged) == ["breakfast"]
+    sight = normalize({**JAVA_ROW, "placeGroup": "ATTRACTIONS", "menuHighlights": ["x"]})
+    assert "menu" not in compact_for_plan(sight, [], "a1")
 
 
 def test_quality_prefers_rated_and_reviewed():

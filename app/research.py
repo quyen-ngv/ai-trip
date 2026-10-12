@@ -8,6 +8,7 @@ catalogue/import flow resolves them.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -39,6 +40,11 @@ example: \"top halal restaurants in Da Nang local guide\", \"hidden gems in Da N
 relaxed family itinerary\", or \"best accessible cultural sights in Hue for seniors\". Never ask
 for Google Maps or map results.
 
+Every query targets places inside the destination itself. A nearby town that travellers visit as a
+destination of its own is out of scope even when it is administratively part of the destination
+(for example Hội An is its own destination although it now belongs to Đà Nẵng city), unless that
+town is the destination.
+
 Return {\"queries\":[{\"group\": one requested group, \"query\": string}]} with exactly the
 requested count for each group. Allowed groups are FOOD_AND_DRINK and ATTRACTIONS (every sight:
 culture, temples, nature, beaches, markets, shopping, landmarks, entertainment); spread the
@@ -47,6 +53,10 @@ ATTRACTIONS queries across those kinds."""
 _RESEARCH_INSTRUCTIONS = """You are a travel web-research agent. You MUST use Web Search before
 answering. Search the Web for the supplied query, then read and cross-check at least the requested
 number of independent editorial, tourism-board, publication, or credible local-guide sources.
+
+Return only places located in the destination itself. Leave out places in nearby towns or cities
+that travellers treat as a separate destination (for example Hội An for a Đà Nẵng trip), even when a
+source lists them as day trips. Give the street address when a source states it.
 
 Do not use Google Maps, maps.google.com, a map listing, a generic business directory, or search
 result snippets as evidence. Extract only concrete places actually named by the sources. Do not
@@ -378,33 +388,58 @@ class WebResearcher:
                 known_titles.add(title_key)
         return rows
 
-    async def research_destination(self, destination: dict[str, Any], needs: dict[str, int], known: list[dict]) -> list[dict]:
+    async def research_destination(self, destination: dict[str, Any], needs: dict[str, int], known: list[dict],
+                                   timeout: float | None = None) -> list[dict]:
+        """Rows from every planned query. Queries run concurrently; when `timeout` seconds pass,
+        the unfinished ones are cancelled and the rows already found are kept. A destination with
+        nothing in the catalogue (anywhere abroad) depends entirely on these rows, so one slow
+        query must not throw the others away."""
         if not needs:
             return []
         if not self.enabled:
             raise RuntimeError("AI Web research requires a Responses/Web Search-capable CHEAP_LLM configuration")
-        cache_key = ResearchCache.key("web-research-v2", self._cache_input(destination, needs))
+        cache_key = ResearchCache.key("web-research-v3", self._cache_input(destination, needs))
         cached = self.cache.get(cache_key) if self.cache_enabled else None
         if isinstance(cached, list):
             logger.info("Web research cache hit for %s", destination.get("name"))
             return [normalize(row, source="web") for row in cached if isinstance(row, dict)]
+        started = time.monotonic()
         query_plan = await self.plan_queries(destination, needs)
         known_titles = {_clean_text(row.get("title"), 255).casefold() for row in known if row.get("title")}
         rows: list[dict] = []
-        for group, queries in query_plan.items():
-            for index, query in enumerate(queries, start=1):
-                response = await self._request(query, destination, group)
-                if response:
-                    rows.extend(self._rows_from_response(response, group, known_titles))
-                if self.reporter:
-                    await self.reporter("web_search", {
-                        "destination": destination.get("name") or "",
-                        "group": group,
-                        "query": index,
-                        "queries": len(queries),
-                        "found": len([row for row in rows if row["placeGroup"] == group]),
-                    })
-        if self.cache_enabled:
+        done_per_group: dict[str, int] = {}
+
+        async def search(group: str, queries: int, query: str) -> None:
+            response = await self._request(query, destination, group)
+            if response:
+                # Synchronous, so concurrent searches cannot interleave inside the title dedupe.
+                rows.extend(self._rows_from_response(response, group, known_titles))
+            done_per_group[group] = done_per_group.get(group, 0) + 1
+            if self.reporter:
+                await self.reporter("web_search", {
+                    "destination": destination.get("name") or "",
+                    "group": group,
+                    "query": done_per_group[group],
+                    "queries": queries,
+                    "found": len([row for row in rows if row["placeGroup"] == group]),
+                })
+
+        tasks = [asyncio.create_task(search(group, len(queries), query))
+                 for group, queries in query_plan.items() for query in queries]
+        pending: set[asyncio.Task] = set()
+        if tasks:
+            left = None if timeout is None else max(1.0, timeout - (time.monotonic() - started))
+            done, pending = await asyncio.wait(tasks, timeout=left)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                if not task.cancelled() and task.exception():
+                    logger.warning("Web research query failed for %s: %s", destination.get("name"), task.exception())
+            if pending:
+                logger.warning("Web research for %s hit its %ss budget: kept %d rows, dropped %d of %d queries",
+                               destination.get("name"), timeout, len(rows), len(pending), len(tasks))
+        # A cut-short result is not cached: the next job should get the full research.
+        if self.cache_enabled and not pending:
             self.cache.put(cache_key, rows, config.WEB_RESEARCH_CACHE_TTL_SECONDS)
         return rows
 
@@ -419,7 +454,7 @@ class WebResearcher:
         } for row in rows]
         cache_value = {"destination": self._cache_input(destination, {}), "candidates": evidence,
                        "limitPerGroup": config.WEB_CURATION_MAX_PER_GROUP}
-        cache_key = ResearchCache.key("web-curation-v1", cache_value)
+        cache_key = ResearchCache.key("web-curation-v2", cache_value)
         cached = self.cache.get(cache_key) if self.cache_enabled else None
         if isinstance(cached, list):
             ids = {str(value) for value in cached}

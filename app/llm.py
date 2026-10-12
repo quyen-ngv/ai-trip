@@ -41,8 +41,12 @@ class CachedModel:
         return bool(self.url and self.key and self.model)
 
     async def json(self, system: str, payload: Any, *, max_tokens: int = 4096, temperature: float = 0.3,
-                   cache: bool = True, retries: int = 1, operation: str = "CHAT") -> Any | None:
-        """Call the model and return the parsed JSON (object or array). None on failure."""
+                   cache: bool = True, retries: int = 1, operation: str = "CHAT",
+                   cache_key: str | None = None, timeout: float | None = None) -> Any | None:
+        """Call the model and return the parsed JSON (object or array). None on failure.
+
+        `cache_key` is the provider-side prompt cache routing key (OpenAI `prompt_cache_key`):
+        requests sharing a static system prefix land on the same cache. Only sent to OpenAI."""
         if not self.configured:
             logger.error("LLM %s not configured", self.prefix)
             return None
@@ -57,12 +61,14 @@ class CachedModel:
         body = {"model": self.model, "temperature": temperature, "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        if cache_key and "openai.com" in self.url:
+            body["prompt_cache_key"] = cache_key
         logger.info("LLM call %s model=%s system=%d chars payload=%d chars", self.prefix, self.model, len(system), len(user))
         value = None
         for attempt in range(retries + 1):
             trace: dict[str, Any] = {}
             started = time.monotonic()
-            value, retryable = await self._call(body, trace)
+            value, retryable = await self._call(body, trace, timeout)
             await self._report(operation, trace, value is not None, int((time.monotonic() - started) * 1000))
             if value is not None or not retryable:
                 break
@@ -81,7 +87,8 @@ class CachedModel:
                             input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
                             latency_ms=latency_ms)
 
-    async def _call(self, body: dict, trace: dict[str, Any] | None = None) -> tuple[Any | None, bool]:
+    async def _call(self, body: dict, trace: dict[str, Any] | None = None,
+                    timeout: float | None = None) -> tuple[Any | None, bool]:
         """(parsed JSON or None, whether an identical retry could succeed).
 
         `trace` receives the request actually sent, the provider's body and any error, for the
@@ -90,7 +97,7 @@ class CachedModel:
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
         content = ""
         try:
-            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=timeout or LLM_TIMEOUT_SECONDS) as client:
                 r = await client.post(f"{self.url}/chat/completions", headers=headers, json=body)
                 # Provider quirks: newer OpenAI models reject `max_tokens` (want `max_completion_tokens`)
                 # and non-default `temperature`; some OpenAI-compatible hosts reject `response_format`.
@@ -105,6 +112,8 @@ class CachedModel:
                         body = {k: v for k, v in body.items() if k != "temperature"}
                     elif "response_format" in err and "response_format" in body:
                         body = {k: v for k, v in body.items() if k != "response_format"}
+                    elif "prompt_cache_key" in err and "prompt_cache_key" in body:
+                        body = {k: v for k, v in body.items() if k != "prompt_cache_key"}
                     else:
                         break
                     r = await client.post(f"{self.url}/chat/completions", headers=headers, json=body)

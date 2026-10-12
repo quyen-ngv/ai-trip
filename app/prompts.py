@@ -52,7 +52,7 @@ DEFAULT_PLAN_RULES = """\
 7. Never output transport items — travel is handled outside the plan.
 8. Discovery style: FAMOUS = mostly high-review-count landmarks; BALANCED = famous anchors + local favourites; HIDDEN_GEMS = local favourites with high ratings, one famous landmark per day for orientation.
 9. Cover the traveller's chosen interests across the trip (not all on one day); vary categories within a day (no three temples in a row); the user's own words override every default.
-10. Descriptions: ONE concise sentence per stop (why go + what to do/eat there), grounded in the given data (a menu dish, the view, the vibe). Trip description: at most 2 short sentences. No marketing fluff, no invented facts.
+10. Descriptions: a short practical guide per stop, written for this traveller (see "Writing each stop" below), grounded in the given data. Trip description: at most 2 short sentences. No marketing fluff, no invented facts.
 11. When social-video candidates are present, preserve their videoSequence order above every optimisation. Keep every social candidate in the itinerary, including unresolved candidates as ACTIVITY rows. If several rows share optionGroupId, output every row separately with the same slot/time; never merge or discard an option.
 """
 
@@ -87,7 +87,19 @@ DEFAULT_TRAVELLER_RULES = """\
 - First day of a destination after a move: start later (nothing before ~10:30 after a morning drive; a light day after an overnight train/bus). Last day: morning only if a move follows.
 """
 
-DEFAULT_DESCRIPTION_MAX_CHARS = 200
+DEFAULT_DESCRIPTION_MAX_CHARS = 600
+
+# Code-owned (not in the config table): how each stop is written. It follows the editable rules,
+# so it wins over an older one-sentence rule still stored there, and it is static text, so it
+# stays inside the cached prompt prefix.
+STOP_WRITING_RULES = """\
+## Writing each stop (this overrides any shorter description rule above)
+- "stay": how many minutes a traveller like this one realistically spends AT the place (not travel), as [min, max], e.g. [45, 60] for a noodle shop, [90, 150] for a big museum. Make start/end fit it whenever the day allows.
+- "description": a mini-guide from a friend who knows the place. Lead with the most useful thing — what to do, see or order here, or why this time of day. Then add only the practical notes that truly matter for THIS stop and THIS traveller, for example: what to try or skip, where to stand for the view, how to get in, what to bring or wear (temples: cover shoulders and knees; beaches: sun cream, swim only at flagged zones), cash vs card, queues and quiet hours, booking, kids/elderly/wheelchair fit, dietary fit, weather or safety cautions.
+- Vary the shape from stop to stop so the plan reads naturally: one or two sentences; or a sentence plus up to 3 short lines starting with "• "; a market can get "what to look for", a viewpoint "when the light is best", a restaurant "what to order + one tip". Never a fixed template, never filler.
+- Accuracy over colour: use the candidate's own data (desc, menu, tags, price, hours, kinds) and stable, widely known facts about well-known places. When something is uncertain, give general advice ("weekends get crowded", "check today's hours before going") instead of a specific claim. Never invent prices, hours, ticket names, phone numbers or dishes that are not in the data.
+- Do not repeat the stop's name, address, start/end time or the "stay" estimate inside the description — the app shows those already.
+- Rest blocks: one short line on how to use the break."""
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -146,14 +158,16 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
 
 {plan_rules}
 {traveller_rules}
+{STOP_WRITING_RULES}
 
 ## Input
-JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Each candidate: id (short ref, e.g. "f3"/"a7"), title, group (activities only; every food candidate is a food venue), category, kinds (curated sub-types such as BEACH, SPIRITUAL, MUSEUM, CAFE, HALAL, VEGETARIAN; trust them over the category text), rating, reviews, lat, lng, km (distance from the destination centre), visitMin, menu, hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc, why (editorial reason). source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
+JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Every food candidate is a food venue; every activity candidate is a sight or activity. Each candidate: id (short ref, e.g. "f3"/"a7"), title, address (street and area), hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc (what the place is, or for Web rows why the cited articles recommend it), kinds (curated sub-types such as BEACH, SPIRITUAL, MUSEUM, CAFE, HALAL, VEGETARIAN) or category when there are no kinds, rating, reviews, lat, lng, visitMin, price (price band such as "1-100k₫" per person, or a level such as "affordable"), tags (facts from the venue's own listing: breakfast/brunch/lunch/dinner/dessert/late_night = meals it serves, kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, groups, solo, view, rooftop, live_music, outdoor, reservation_required, touristy), menu (food only: signature dishes). Any field may be missing.
+Treat price, tags and menu as facts: breakfast goes to venues tagged breakfast (or clearly breakfast food); children prefer "kids" venues and never "alcohol"-led bars; wheelchair users need "wheelchair"; dietary restrictions need veg/vegan/halal tags, kinds or a fitting menu; respect the budget through price. Name a real dish from menu in a food stop's description when it fits. source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
 
 ## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
 {{"tripDescription":"...","days":[{{"dayNumber":1,"stops":[
-  {{"id":"f3","start":"07:30","end":"08:15","description":"..."}},
-  {{"id":"a7","start":"08:30","end":"10:00","description":"..."}},
+  {{"id":"f3","start":"07:30","end":"08:15","stay":[30,45],"description":"..."}},
+  {{"id":"a7","start":"08:30","end":"10:00","stay":[60,90],"description":"..."}},
   {{"rest":"hotel","start":"12:30","end":"14:30","description":"..."}}
 ]}}]}}
 Every place stop uses the candidate's "id" exactly as given.
@@ -164,4 +178,4 @@ Every place stop uses the candidate's "id" exactly as given.
 Destination: {destination}. Plan {days} day(s): {day_list}.{extra}
 If this is a social-video itinerary, videoSequence is the strongest ordering signal. Do not reorder solely for rating, geography, meals, or opening hours. Keep alternative options as distinct stops (same optionGroupId and same time); the user can choose later.
 Fill every day from morning to evening according to the traveller profile. Times are local "HH:MM", chronological within a day, no overlaps, with realistic travel gaps between stops.
-Write all free text in {language(locale)}. Each stop description <= {max_chars} characters, one sentence. tripDescription <= 2 short sentences."""
+Write all free text in {language(locale)}. Each stop description <= {max_chars} characters. tripDescription <= 2 short sentences."""

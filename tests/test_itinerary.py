@@ -260,3 +260,32 @@ def test_trip_text_is_the_extracted_overview_then_its_advice():
     assert text == ("Hai ngày thong thả giữa đồi chè và quán cà phê.\n"
                     "• Thuê xe máy để đi lại\n• Mang áo ấm buổi tối")
     assert social_trip_text({}) == ""
+
+
+def test_stay_estimates_are_parsed_and_labelled():
+    from app.itinerary import add_time_estimates, fit_text, parse_stay, stay_label
+    assert parse_stay([45, 60]) == (45, 60) and parse_stay(90) == (90, 90) and parse_stay("60-90 min") == (60, 90)
+    assert parse_stay("lâu") is None and parse_stay([0, 30]) is None and parse_stay([60, 900]) is None
+    assert stay_label(45, 60, "vi") == "⏱ Nên dành 45–60 phút"
+    assert stay_label(90, 120, "vi") == "⏱ Nên dành 1,5–2 giờ"
+    assert stay_label(45, 90, "en") == "⏱ Plan for 45 min–1.5 h"
+    items = [{"type": "PLACE_VISIT", "startTime": "08:00:00", "endTime": "09:00:00", "description": "Xem.", "_stay": (60, 90)},
+             {"type": "ACTIVITY", "startTime": "12:00:00", "endTime": "14:00:00", "description": "Nghỉ.", "_rest": True},
+             {"type": "TRANSPORT", "startTime": "10:00:00", "endTime": "10:20:00"},
+             {"type": "PLACE_VISIT", "startTime": "18:00:00", "endTime": "18:45:00", "description": None}]
+    add_time_estimates(items, "vi")
+    assert items[0]["description"] == "⏱ Nên dành 1–1,5 giờ\nXem."
+    assert items[1]["description"] == "Nghỉ." and "description" not in items[2]
+    assert items[3]["description"] == "⏱ Nên dành 45 phút"
+    assert fit_text("Câu đầu tiên khá là dài. Câu hai rất dài " + "x" * 50, 30) == "Câu đầu tiên khá là dài."
+    cut = fit_text("Một câu rất dài không có dấu chấm nào cả cho tới tận cuối", 30)
+    assert cut.endswith("…") and len(cut) <= 30 and not cut[:-1].endswith(" ")
+
+
+def test_planner_stay_reaches_the_item():
+    items, _, _ = run([
+        {"placeId": IDS["Quán 0"], "start": "07:30", "end": "08:15", "stay": [30, 45], "description": "Sáng."},
+        {"placeId": IDS["Quán 1"], "start": "12:00", "end": "13:00", "description": "Trưa."},
+        {"placeId": IDS["Quán 2"], "start": "18:30", "end": "19:30", "description": "Tối."},
+    ])
+    assert items[0]["_stay"] == (30, 45) and "_stay" not in items[1]

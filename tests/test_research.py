@@ -120,6 +120,30 @@ async def test_research_rejects_results_without_the_required_number_of_web_sourc
     assert rows == []
 
 
+@pytest.mark.asyncio
+async def test_research_keeps_finished_queries_when_the_budget_runs_out():
+    import asyncio
+    import time
+
+    researcher = WebResearcher(
+        query_model=FakeQueryModel(), base_url="https://api.example/v1", api_key="key", model="web-model",
+        min_sources_per_query=3,
+    )
+    researcher.cache_enabled = False
+
+    async def fake_request(query, destination, group):
+        if group == "ATTRACTIONS":
+            await asyncio.sleep(30)  # a stuck search must not cost the food results
+        return web_response()
+
+    researcher._request = fake_request
+    started = time.monotonic()
+    rows = await researcher.research_destination(
+        {"name": "Seattle"}, {"FOOD_AND_DRINK": 3, "ATTRACTIONS": 3}, [], timeout=1)
+    assert time.monotonic() - started < 5
+    assert [(row["title"], row["placeGroup"]) for row in rows] == [("Halal Kitchen Da Nang", "FOOD_AND_DRINK")]
+
+
 def test_web_research_reuses_the_cheap_model_responses_configuration():
     class CheapModel(FakeQueryModel):
         url = "https://api.openai.com/v1"
