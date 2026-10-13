@@ -114,30 +114,32 @@ async def test_graph_end_to_end(monkeypatch):
     assert all(p["title"] for p in payload["food"]) and all(p.get("address") for p in payload["food"])
     # dishes now reach the planner (the food-lover rule names them); distance and group stay out
     assert not any("km" in p or "group" in p for p in payload["food"])
-    assert all(isinstance(p.get("menu", []), list) and len(p.get("menu", [])) <= 6 for p in payload["food"])
+    assert all(isinstance(p.get("menu", []), list) and len(p.get("menu", [])) <= 10 for p in payload["food"])
     rest = [i for i in items if i["name"] == "Nghỉ ngơi tại khách sạn"]
     assert rest and rest[0]["type"] == "ACTIVITY"
     assert fake_java.events[-1][0] == "SAVING"
 
 
+class RecordingResearcher:
+    calls: list = []
+
+    def __init__(self, **kwargs):
+        self.enabled = True
+
+    async def research_destination(self, destination, needs, known, timeout=None):
+        self.calls.append((destination["name"], needs))
+        return []
+
+
+async def dense_candidates(destination, groups, limit):
+    group = groups[0]
+    return [java_row(i + (0 if group == "FOOD_AND_DRINK" else 100), group) for i in range(30)]
+
+
 @pytest.mark.asyncio
-async def test_graph_researches_the_web_even_when_catalogue_is_sufficient(monkeypatch):
-    class RecordingResearcher:
-        calls = []
-
-        def __init__(self, **kwargs):
-            self.enabled = True
-
-        async def research_destination(self, destination, needs, known, timeout=None):
-            self.calls.append((destination["name"], needs, len(known)))
-            return []
-
+async def test_graph_skips_web_research_when_catalogue_is_sufficient(monkeypatch):
+    RecordingResearcher.calls = []
     fake_java, fake_llm = FakeJava(), FakeLLM()
-
-    async def dense_candidates(destination, groups, limit):
-        group = groups[0]
-        return [java_row(i + (0 if group == "FOOD_AND_DRINK" else 100), group) for i in range(30)]
-
     fake_java.candidates = dense_candidates
     monkeypatch.setattr(workflow, "JavaClient", lambda job, token: fake_java)
     monkeypatch.setattr(workflow, "CachedModel", lambda *args, **kwargs: fake_llm)
@@ -146,9 +148,66 @@ async def test_graph_researches_the_web_even_when_catalogue_is_sufficient(monkey
     graph = await workflow.build_workflow(JOB, "tok")
     await graph.ainvoke({"job": JOB})
 
-    assert RecordingResearcher.calls == [
-        ("Hà Nội", {"FOOD_AND_DRINK": 3, "ATTRACTIONS": 9}, 0),
-    ]
+    assert RecordingResearcher.calls == []
+    assert fake_java.committed is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_researches_only_the_short_group(monkeypatch):
+    RecordingResearcher.calls = []
+    fake_java, fake_llm = FakeJava(), FakeLLM()      # 14 food, 8 sights for 2 BALANCED days
+    monkeypatch.setattr(workflow, "JavaClient", lambda job, token: fake_java)
+    monkeypatch.setattr(workflow, "CachedModel", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(workflow, "WebResearcher", RecordingResearcher)
+
+    graph = await workflow.build_workflow(JOB, "tok")
+    await graph.ainvoke({"job": JOB})
+
+    # food covers 6 meals × 2; sights need ceil(3×2×2.5)=15, 8 present → 7 short
+    assert RecordingResearcher.calls == [("Hà Nội", {"ATTRACTIONS": 7})]
+
+
+@pytest.mark.asyncio
+async def test_cheap_selection_ranks_the_planner_shortlist(monkeypatch):
+    """With a catalogue bigger than the shortlist, the cheap model picks by fit and its picks
+    lead the planner payload; everything else is the quality-ranked remainder."""
+
+    class SelectingLLM(FakeLLM):
+        async def json(self, system, payload, **kw):
+            if kw.get("operation") == "SELECT_CANDIDATES":
+                self.calls.append((system, payload))
+                assert "muốn ăn phở" in system and "no_pork" in system
+                assert all(set(p) <= {"id", "title", "kinds", "category", "desc", "price", "tags", "menu", "rating", "reviews"}
+                           for p in payload["food"] + payload["activities"])
+                # pick the worst-rated rows on purpose: fit must beat rating
+                return {"food": [p["id"] for p in payload["food"][-5:]],
+                        "activities": [p["id"] for p in payload["activities"][-3:]]}
+            return await super().json(system, payload, **kw)
+
+    fake_java, fake_llm = FakeJava(), SelectingLLM()
+
+    async def graded(destination, groups, limit):
+        rows = await dense_candidates(destination, groups, limit)
+        for n, r in enumerate(rows):
+            r["reviewRating"], r["reviewCount"] = 5.0 - n * 0.1, 3000 - n * 50
+        return rows
+
+    fake_java.candidates = graded
+    monkeypatch.setattr(workflow, "JavaClient", lambda job, token: fake_java)
+    monkeypatch.setattr(workflow, "CachedModel", lambda *args, **kwargs: fake_llm)
+    monkeypatch.setattr(workflow, "WebResearcher", NoopWebResearcher)
+
+    graph = await workflow.build_workflow(JOB, "tok")
+    await graph.ainvoke({"job": JOB})
+
+    select_call, plan_call = fake_llm.calls
+    picked_food = {p["title"] for p in select_call[1]["food"][-5:]}
+    picked_acts = {p["title"] for p in select_call[1]["activities"][-3:]}
+    plan_food = [p["title"] for p in plan_call[1]["food"]]
+    plan_acts = [p["title"] for p in plan_call[1]["activities"]]
+    assert set(plan_food[:5]) == picked_food
+    assert set(plan_acts[:3]) == picked_acts
+    assert len(plan_food) == 18 and len(plan_acts) == 18          # caps unchanged: 3×6 meals, 3×6 stops
 
 
 @pytest.mark.asyncio
@@ -229,13 +288,13 @@ async def test_multi_destination_long_hop(monkeypatch):
 def test_prompt_contains_rules_and_preferences():
     req = JOB["request"]
     p = build_itinerary_prompt(req, "vi", "Đà Nẵng", 2, [1, 2], ["Monday", "Tuesday"], {})
-    assert "JSON" in p and "Kid-friendly" in p and "NEVER a cafe" in p
+    assert "JSON" in p and "Kid-friendly" in p and "Street breakfast sells out" in p
     assert "## Local knowledge for this destination" not in p
     block = preferences_block({"groupComposition": "Family with children", "mobilityConsiderations": ["Kid-friendly"]}, "en")
     assert "Kid-friendly" in block and "Family with children" in block
     # config overrides the built-in rules
     p2 = build_itinerary_prompt(req, "en", "Huế", 1, [1], ["Monday"], {"PLAN_RULES": "MY CUSTOM RULES"})
-    assert "MY CUSTOM RULES" in p2 and "NEVER a cafe" not in p2
+    assert "MY CUSTOM RULES" in p2 and "Street breakfast sells out" not in p2
 
 
 def test_shortlist_keeps_web_rows_when_catalogue_is_full():

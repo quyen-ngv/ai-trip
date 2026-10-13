@@ -21,17 +21,18 @@ time, in what order, rest blocks, and all wording. Code never re-plans. It only:
 - falls back to a code-only itinerary (`scheduler.py`) if the model's JSON is unusable.
 
 ```
-validate → retrieve → research → plan → verify → commit
+validate → retrieve → [select_candidates | web_research] → curate_web → resolve_places → plan → verify → commit
 ```
 
 | Step | Who | What |
 |---|---|---|
 | validate | code | Reject impossible date ranges; load prompt rules from `config` (label `AI_TRIP`). |
 | retrieve | code | `/candidates` once per place group per destination (FOOD always requested), normalised. |
-| web_research | **cheap AI query planner + browser Web Search** | For every destination with coordinates, a model writes one to three distinct Web queries per Food/requested spot group from the traveller's dietary, mobility, group, pace, activity, discovery, budget and free-text preferences. The browser tool must read at least three independent editorial/tourism/local-guide sources per query, then extracts only named places with cited URLs. Google Maps and map/directory results are excluded. Queries run concurrently; a shared job budget bounds the work, and when it runs out the unfinished queries are cancelled while the rows already found are kept (a destination with nothing in the catalogue, e.g. abroad, depends on them entirely). |
+| select_candidates | **cheap LLM** | Runs in parallel with web_research. Reads the WHOLE catalogue of a destination (compact rows: title, kinds, short description, price, tags, dishes; rating last) with the traveller profile including free text, and returns the shortlist ids by fit: user's words and hard constraints → interests/style/budget → meal coverage and kind diversity → rating. `shortlist` ranks those first and uses `quality` only as a tie-breaker; a model failure falls back to quality ranking. Skipped when the catalogue already fits the shortlist caps. |
+| web_research | **cheap AI query planner + browser Web Search** | Only for the groups the catalogue cannot cover (`research_needs` = `shortage`, floor `AI_TRIP_WEB_RESEARCH_MIN_CANDIDATES_PER_GROUP`); a destination with enough catalogue rows makes no search at all. A model writes one to three distinct Web queries per short group from the traveller's dietary, mobility, group, pace, activity, discovery, budget and free-text preferences. The browser tool must read at least three independent editorial/tourism/local-guide sources per query, then extracts only named places with cited URLs. Google Maps and map/directory results are excluded. Queries run concurrently; a shared job budget bounds the work, and when it runs out the unfinished queries are cancelled while the rows already found are kept (a destination with nothing in the catalogue, e.g. abroad, depends on them entirely). |
 | curate_web | **cheap LLM** | Chooses only IDs supplied by the cited Web evidence, keeping diverse candidates that match the traveller request. |
 | resolve_places | **Java catalogue / Goong or Mapbox** | Java first accepts only a unique exact normalized catalogue-title match within 50 km. Otherwise it calls the map provider server-side (Mapbox outside Vietnam, where Goong has nothing; the requester's provider inside) and accepts only an exact normalized result within 50 km. Raw Web addresses and coordinates are discarded; unresolved candidates have no address/coordinates. |
-| plan | **quality LLM** | One call per destination → places, days, times, order, rest blocks, per-stop descriptions, trip description. Each candidate is sent as name, address, opening hours and description (the catalogue's `aiDescription`, or the cited reason for a Web row), plus kind, coordinates, rating/review count and visit length; no menu, distance or attributes. |
+| plan | **quality LLM** | One call per destination → the area of each half-day, places, days, times, order, rest blocks, per-stop descriptions, trip description. Each candidate is sent as name, address, opening hours and description (the catalogue's `aiDescription`, or the cited reason for a Web row), plus kind, coordinates, rating/review count, visit length, price, tags and up to 6 signature dishes; no distance or attributes. |
 | verify | code | Logs remaining violations (missing meal, thin day, duplicates). **Does not modify the plan.** |
 | commit | code | `validators.finalize` enforces Java's contract, then posts. |
 
@@ -47,11 +48,24 @@ Rows in `config` with label `AI_TRIP`, edited in goroute-admin, read at the star
 |---|---|
 | `PLAN_RULES` | Core rules: meals, geography/travel time, time-of-day fit, visit lengths, rest blocks, descriptions. |
 | `TRAVELLER_RULES` | Rules per profile: pace, children, elderly, couples, friends, solo, adventure, photography, food lovers, dietary, arrival/departure. |
-| `DESCRIPTION_MAX_CHARS` | Character cap per activity description (default 200). |
+| `DESCRIPTION_MAX_CHARS` | Character cap per activity description (default 600, shrunk for long trips). |
 
 `app/prompts.py` holds the same text as `DEFAULT_*` constants: the fallback when the table or the
-endpoint is unavailable, and the seed for migration `V148__ai_trip_prompt_config.sql`. Keep them
-in sync when editing defaults in code.
+endpoint is unavailable, and the seed for migrations `V148__ai_trip_prompt_config.sql`, `V229`
+and `V235__ai_trip_prompt_rules_2026_10.sql`. Keep them in sync when editing defaults in code: a
+new migration updates the rows only while they still hold the previous seed, so an operator's edit
+in goroute-admin survives a deploy.
+
+How the prompt is built (2026-10-13; research in `.docs/AI_TRIP_PLANNING_KNOWLEDGE.md` §E):
+
+- static text first (identity, the two rule blocks, `STOP_WRITING_RULES`, the input legend, the
+  output contract), then the traveller profile and the task, so OpenAI/DeepSeek prefix caching
+  bills the shared part as cached input (OpenAI also gets `prompt_cache_key = ai-trip-plan`);
+- rules say what to do, grouped under short headers, about 45 atomic constraints in total;
+- every pace block carries a day skeleton (anchors + light stops), the heat window is
+  10:30-15:30, and the evening block after dinner is the default Vietnamese evening;
+- the model writes each day's `area` (morning → afternoon) before its stops, and the prompt ends
+  with a five-line self-check that repeats the hard constraints.
 
 ## Environment
 

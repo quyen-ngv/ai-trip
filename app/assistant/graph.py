@@ -3,6 +3,10 @@
 Each model round may call tools; each tool call is shown live in the chat as a step. The loop is
 bounded (`maxToolCalls` per turn, then the model must answer), and the whole turn has a time
 limit. Whatever happens, Java hears back exactly once: a reply, or a failure.
+
+A round that neither calls a tool nor returns the final JSON is usually the model announcing
+work ("Mình xem thời tiết nhé") and stopping. That text is never posted as the answer: the model
+is sent back once to either call the tool or answer properly.
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .. import ai_log
+from . import web_search
 from .chat_model import ChatModel
 from .gateway import JavaGateway, TurnClosed
 from .prompts import SYSTEM, context_message, history_messages
@@ -24,19 +29,40 @@ logger = logging.getLogger(__name__)
 
 TURN_TIMEOUT_SECONDS = 120
 MAX_TOOL_RESULT_CHARS = 6000
+# The whole destination catalogue with its guide text is read in one go; cutting it would hide
+# destinations from the model.
+TOOL_RESULT_CHARS = {"explore_destinations": 40000}
+MAX_WEB_SEARCHES = 1
+MAX_ACTIONS = 3
+MAX_CARDS = 6
+MAX_DESTINATIONS = 4
+# Card type -> the id pools (see tools.collect_names) an id must come from.
+CARD_POOLS = {"TRIP": ("public_trip", "trip"), "EVENT": ("event",), "MEETUP": ("meetup",),
+              "CHECKIN": ("checkin",), "FOOD": ("dish",)}
+MAX_MEMORY_CHARS = 1500
+NUDGE = ("Your last message was neither a tool call nor the final JSON, so the user would see nothing useful. "
+         "If you meant to check something, call that tool now. Otherwise reply with the final JSON answer.")
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.S)
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TIME = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+PROPOSAL_ACTIONS = ("ADD", "MOVE", "UPDATE_TIME", "REMOVE", "REPLACE",
+                    "ADD_DAYS", "PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES")
+# Changes to the days themselves go first (Java keeps one and the adds it needs).
+_DAY_CHANGES = ("PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES", "ADD_DAYS")
 
 
 class State(TypedDict, total=False):
     messages: list[dict]
     tool_calls: int
+    web_searches: int
+    nudged: bool
     final: dict
     usage: dict
 
 
-def parse_final(content: str) -> dict:
-    """The model's closing JSON; plain text (a model that ignored the format) becomes the answer."""
+def parse_json(content: str) -> dict | None:
+    """The model's closing JSON object, or None when the content is not one."""
     text = _FENCE.sub("", content or "").strip()
     match = _JSON_OBJECT.search(text)
     for candidate in (text, match.group(0) if match else None):
@@ -46,13 +72,91 @@ def parse_final(content: str) -> dict:
             value = json.loads(candidate)
         except (TypeError, ValueError):
             continue
-        if isinstance(value, dict) and ("answer" in value or "places" in value):
+        if isinstance(value, dict) and ("answer" in value or "places" in value or "actions" in value):
             return value
-    return {"answer": text}
+    return None
 
 
-def clean_reply(final: dict, allowed_places: set[str], usage: dict) -> dict:
-    """What Java receives: bounded lists, places only from this turn's tool results or the trip."""
+def parse_final(content: str) -> dict:
+    """The model's closing JSON; plain text (a model that ignored the format) becomes the answer."""
+    return parse_json(content) or {"answer": _FENCE.sub("", content or "").strip()}
+
+
+def clean_actions(raw: Any, ids: dict[str, set[str]]) -> list[dict]:
+    """Buttons: open actions only for ids the tools or the chat produced; Java checks access again."""
+    needs = {"OPEN_TRIP": ("tripId", "trip"), "OPEN_EVENT": ("eventId", "event"),
+             "OPEN_MEETUP": ("meetupId", "meetup")}
+    actions: list[dict] = []
+    for item in raw or []:
+        if not isinstance(item, dict) or len(actions) >= MAX_ACTIONS:
+            continue
+        action = str(item.get("action") or "").upper()
+        label = str(item.get("label") or "").strip()[:80]
+        if not label:
+            continue
+        if action == "CREATE_TRIP":
+            out = {"action": action, "label": label}
+            if item.get("city"):
+                out["city"] = str(item["city"]).strip()[:80]
+            start, end = str(item.get("startDate") or ""), str(item.get("endDate") or "")
+            if _DATE.fullmatch(start) and _DATE.fullmatch(end):
+                out["startDate"], out["endDate"] = start, end
+            actions.append(out)
+        elif action in needs:
+            key, kind = needs[action]
+            target = str(item.get(key) or "")
+            if target in ids.get(kind, set()):
+                actions.append({"action": action, "label": label, key: target})
+    return actions
+
+
+def clean_cards(raw: Any, ids: dict[str, set[str]]) -> list[dict]:
+    """Cards of public items: only ids this turn's tools returned; Java checks each is shareable."""
+    cards: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw or []:
+        if not isinstance(item, dict) or len(cards) >= MAX_CARDS:
+            continue
+        kind = str(item.get("type") or "").upper()
+        target = str(item.get("id") or "")
+        pools = CARD_POOLS.get(kind)
+        if not pools or (kind, target) in seen or not any(target in ids.get(pool, set()) for pool in pools):
+            continue
+        card = {"type": kind, "id": target}
+        if kind == "FOOD":
+            slug = str(item.get("citySlug") or "").strip()
+            if not slug:
+                continue
+            card["citySlug"] = slug[:64]
+        seen.add((kind, target))
+        cards.append(card)
+    return cards
+
+
+def clean_destinations(raw: Any, ids: dict[str, set[str]]) -> list[dict]:
+    """Destination cards: only areas a tool returned in this turn; dates only as a valid pair."""
+    out: list[dict] = []
+    for item in raw or []:
+        if not isinstance(item, dict) or len(out) >= MAX_DESTINATIONS:
+            continue
+        target = str(item.get("id") or item.get("destinationId") or "")
+        if target not in ids.get("destination", set()) or any(d["id"] == target for d in out):
+            continue
+        card = {"id": target}
+        note = str(item.get("note") or "").strip()[:300]
+        if note:
+            card["note"] = note
+        start, end = str(item.get("startDate") or ""), str(item.get("endDate") or "")
+        if _DATE.fullmatch(start) and _DATE.fullmatch(end):
+            card["startDate"], card["endDate"] = start, end
+        out.append(card)
+    return out
+
+
+def clean_reply(final: dict, allowed_places: set[str], usage: dict,
+                ids: dict[str, set[str]] | None = None) -> dict:
+    """What Java receives: bounded lists, places only from this turn's tool results, earlier
+    cards or the trip; buttons only for ids seen in this turn."""
     places, seen = [], set()
     for item in final.get("places") or []:
         if not isinstance(item, dict):
@@ -64,14 +168,17 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict) -> dict:
             places.append({"placeId": place_id, "note": note})
     proposals = []
     for item in final.get("proposals") or []:
-        if isinstance(item, dict) and item.get("action") in ("ADD", "MOVE", "UPDATE_TIME", "REMOVE"):
-            proposal = {key: item.get(key) for key in ("action", "tripId", "dayNumber", "toDayNumber", "startTime",
-                                                       "endTime", "placeId", "activityId", "category", "summary")
+        if isinstance(item, dict) and item.get("action") in PROPOSAL_ACTIONS:
+            proposal = {key: item.get(key) for key in ("action", "tripId", "dayNumber", "toDayNumber", "days",
+                                                       "startDate", "startTime", "endTime", "placeId", "activityId",
+                                                       "category", "summary")
                         if item.get(key) not in (None, "")}
             for key in ("startTime", "endTime"):
-                if key in proposal and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(proposal[key])):
+                if key in proposal and not _TIME.fullmatch(str(proposal[key])):
                     proposal.pop(key)
-            for key in ("dayNumber", "toDayNumber"):
+            if "startDate" in proposal and not _DATE.fullmatch(str(proposal["startDate"])):
+                proposal.pop("startDate")
+            for key in ("dayNumber", "toDayNumber", "days"):
                 if key in proposal:
                     try:
                         proposal[key] = int(proposal[key])
@@ -80,19 +187,40 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict) -> dict:
             if "summary" in proposal:
                 proposal["summary"] = str(proposal["summary"])[:300]
             proposals.append(proposal)
+    # A day change must survive the cap: the ADDs for new days are dropped without their extension.
+    proposals.sort(key=lambda p: p["action"] not in _DAY_CHANGES)
     suggestions = [str(s).strip()[:120] for s in (final.get("suggestions") or []) if str(s).strip()][:4]
     answer = str(final.get("answer") or "").strip()[:8000]
-    return {"markdown": answer, "places": places[:8], "proposals": proposals[:6], "suggestions": suggestions,
-            "inputTokens": usage.get("input", 0), "outputTokens": usage.get("output", 0)}
+    reply = {"markdown": answer, "places": places[:8], "proposals": proposals[:6], "suggestions": suggestions,
+             "actions": clean_actions(final.get("actions"), ids or {}),
+             "cards": clean_cards(final.get("cards"), ids or {}),
+             "destinations": clean_destinations(final.get("destinations"), ids or {}),
+             "inputTokens": usage.get("input", 0), "outputTokens": usage.get("output", 0)}
+    memory = final.get("memory")
+    if isinstance(memory, str) and memory.strip():
+        reply["memory"] = memory.strip()[:MAX_MEMORY_CHARS]
+    return reply
 
 
 def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     limits = turn.get("limits") or {}
     max_tool_calls = int(limits.get("maxToolCalls") or 6)
     max_output = int(limits.get("maxOutputTokens") or 1800)
-    tools = tools_for(str(turn.get("conversationType") or "TRIP"))
+    web_allowed = bool(limits.get("webSearch")) and web_search.configured()
+    tools = tools_for(str(turn.get("conversationType") or "TRIP"), web_search=web_allowed)
+    # One provider cache per tool list: the trip chat and the 1:1 chat send different tools, and a
+    # changed tool list is a different prefix.
+    cache_key = f"pengoo-v3-{str(turn.get('conversationType') or 'TRIP').lower()}{'-web' if web_allowed else ''}"
     names: dict[str, str] = {}
-    allowed_places: set[str] = set()
+    ids: dict[str, set[str]] = {"place": set(), "event": set(), "meetup": set(), "trip": set(),
+                                "public_trip": set(), "checkin": set(), "dish": set(), "destination": set()}
+    allowed_places = ids["place"]
+    for row in turn.get("history") or []:
+        for place in row.get("places") or []:
+            if isinstance(place, dict) and place.get("id"):
+                allowed_places.add(str(place["id"]))
+                if place.get("name"):
+                    names[str(place["id"])] = str(place["name"])
     trip = turn.get("trip") or {}
     for day in trip.get("days") or []:
         for activity in day.get("activities") or []:
@@ -100,8 +228,10 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                 names[str(activity["id"])] = str(activity["name"])
             if activity.get("placeId"):
                 allowed_places.add(str(activity["placeId"]))
-    if trip.get("id") and trip.get("name"):
-        names[str(trip["id"])] = str(trip["name"])
+    if trip.get("id"):
+        ids["trip"].add(str(trip["id"]))
+        if trip.get("name"):
+            names[str(trip["id"])] = str(trip["name"])
 
     async def agent(state: State) -> State:
         budget_left = max_tool_calls - state.get("tool_calls", 0)
@@ -109,7 +239,7 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         if budget_left <= 0:
             messages.append({"role": "system", "content": "Tool budget used up: write the final JSON answer now."})
         reply = await model.complete(messages, tools if budget_left > 0 else None, max_tokens=max_output,
-                                     operation="ASSISTANT_TURN", cache_key="pengoo-v1")
+                                     operation="ASSISTANT_TURN", cache_key=cache_key)
         if reply is None:
             raise RuntimeError("model call failed")
         usage = dict(state.get("usage") or {"input": 0, "output": 0})
@@ -123,12 +253,20 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
             if content and not content.startswith("{"):
                 await java.step("thought", {}, content[:300])
             return {"messages": state["messages"] + [message], "usage": usage}
-        return {"messages": state["messages"] + [message], "usage": usage, "final": parse_final(content)}
+        final = parse_json(content)
+        if final is None and budget_left > 0 and not state.get("nudged"):
+            # Announced work without doing it, or ignored the format: one more round to act.
+            if content:
+                await java.step("thought", {}, content[:300])
+            return {"messages": state["messages"] + [message, {"role": "system", "content": NUDGE}],
+                    "usage": usage, "nudged": True}
+        return {"messages": state["messages"] + [message], "usage": usage, "final": final or parse_final(content)}
 
     async def run_tools(state: State) -> State:
         last = state["messages"][-1]
         results: list[dict] = []
         used = state.get("tool_calls", 0)
+        searched = state.get("web_searches", 0)
         for call in last.get("tool_calls") or []:
             function = call.get("function") or {}
             name = function.get("name") or ""
@@ -140,27 +278,36 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                 args = {}
             key, params = step_for(name, args, names)
             await java.step(key, params)
-            result = await java.tool(name, args)
-            collect_names(result, names, allowed_places)
+            if name == "web_search":
+                if not web_allowed or searched >= MAX_WEB_SEARCHES:
+                    result: dict = {"error": "Web search is not available for this answer; answer from what you have."}
+                else:
+                    searched += 1
+                    result = await web_search.search(str(args.get("query") or ""))
+            else:
+                result = await java.tool(name, args)
+                collect_names(result, names, ids)
             used += 1
             results.append({"role": "tool", "tool_call_id": call.get("id"),
-                            "content": json.dumps(result, ensure_ascii=False, default=str)[:MAX_TOOL_RESULT_CHARS]})
-        return {"messages": state["messages"] + results, "tool_calls": used}
+                            "content": json.dumps(result, ensure_ascii=False, default=str)[:TOOL_RESULT_CHARS.get(name, MAX_TOOL_RESULT_CHARS)]})
+        return {"messages": state["messages"] + results, "tool_calls": used, "web_searches": searched}
 
     async def finish(state: State) -> State:
         await java.step("writing_answer", {})
-        await java.reply(clean_reply(state.get("final") or {}, allowed_places, state.get("usage") or {}))
+        await java.reply(clean_reply(state.get("final") or {}, allowed_places, state.get("usage") or {}, ids))
         return {}
 
     def route(state: State) -> str:
-        return "finish" if state.get("final") is not None else "tools"
+        if state.get("final") is not None:
+            return "finish"
+        return "tools" if state["messages"][-1].get("tool_calls") else "agent"
 
     graph = StateGraph(State)
     graph.add_node("agent", agent)
     graph.add_node("tools", run_tools)
     graph.add_node("finish", finish)
     graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", route, {"tools": "tools", "finish": "finish"})
+    graph.add_conditional_edges("agent", route, {"tools": "tools", "finish": "finish", "agent": "agent"})
     graph.add_edge("tools", "agent")
     graph.add_edge("finish", END)
     return graph.compile()
@@ -192,8 +339,8 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
         if turn.get("trip"):
             await java.step("reading_trip", {})
         graph = build_graph(turn, java, chosen)
-        # Each agent round plus its tool round is two graph steps, plus start and finish.
-        limit = 2 * (int((turn.get("limits") or {}).get("maxToolCalls") or 6) + 2) + 4
+        # Each agent round plus its tool round is two graph steps, plus one nudge round, start and finish.
+        limit = 2 * (int((turn.get("limits") or {}).get("maxToolCalls") or 6) + 2) + 6
         await asyncio.wait_for(graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0},
                                              {"recursion_limit": limit}), timeout=TURN_TIMEOUT_SECONDS)
     except TurnClosed:

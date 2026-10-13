@@ -65,19 +65,22 @@ def test_shortage_asks_for_food_and_selected_groups_only():
     assert set(need) == {FOOD, "ATTRACTIONS"}
 
 
-def test_research_needs_enriches_even_a_sufficient_catalogue():
+def test_research_needs_is_empty_when_the_catalogue_covers_the_stay():
     rows = [
         normalize({**JAVA_ROW, "id": f"food-{i}"}) for i in range(20)
     ] + [
         normalize({**JAVA_ROW, "id": f"culture-{i}", "googlePlaceId": f"culture-google-{i}",
                    "placeGroup": "CULTURE_AND_HERITAGE"}) for i in range(20)
     ]
-    # Legacy culture rows are read as ATTRACTIONS, whose research budget is three groups' worth.
+    # Legacy culture rows are read as ATTRACTIONS.
     assert all(r["placeGroup"] == "ATTRACTIONS" for r in rows[20:])
+    assert research_needs(rows, "BALANCED", 1, ["ATTRACTIONS"], minimum_per_group=3) == {}
+
+
+def test_research_needs_asks_only_for_the_short_groups_with_a_floor():
+    rows = [normalize({**JAVA_ROW, "id": f"food-{i}"}) for i in range(5)]   # 5 food, no sights
     needs = research_needs(rows, "BALANCED", 1, ["ATTRACTIONS"], minimum_per_group=3)
-    assert needs == {FOOD: 3, "ATTRACTIONS": 9}
-    assert research_needs(rows, "RELAXED", 1, ["CULTURE_AND_HERITAGE"], minimum_per_group=3)[FOOD] == 2
-    assert research_needs(rows, "EAGER", 1, ["CULTURE_AND_HERITAGE"], minimum_per_group=3)[FOOD] == 4
+    assert needs == {FOOD: 3, "ATTRACTIONS": 8}      # food short by 1 → floor 3; sights ceil(3*2.5)=8
 
 
 def test_category_and_meal_hints():

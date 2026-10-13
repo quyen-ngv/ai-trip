@@ -30,56 +30,57 @@ Reporter = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 _QUERY_SYSTEM = """You write Web-search queries for a trip planner. Return JSON only.
 
-Create the requested number of genuinely different, natural-language Web queries for every
-requested place group. Queries must name the destination and faithfully incorporate the traveller
-request: dietary restrictions (for example Halal), pace, travel style, group composition,
-children/elderly/accessibility, activity interests, discovery style, budget and free text.
+Write the requested number of genuinely different, natural-language Web queries for every
+requested place group. Each query names the destination and carries the traveller request that
+matters for that group: dietary rules (for example Halal), pace, travel style, group composition,
+children, elderly or accessibility, activity interests, discovery style, budget and free text.
 
-The goal is evidence from editorial/local-guide articles, not a map or business directory. For
-example: \"top halal restaurants in Da Nang local guide\", \"hidden gems in Da Nang for a
-relaxed family itinerary\", or \"best accessible cultural sights in Hue for seniors\". Never ask
-for Google Maps or map results.
+Aim at editorial and local-guide articles ("top halal restaurants in Da Nang local guide",
+"hidden gems in Da Nang for a relaxed family itinerary", "accessible cultural sights in Hue for
+seniors"), which is where named places with context live; a map or business directory is not a
+source here.
 
-Every query targets places inside the destination itself. A nearby town that travellers visit as a
-destination of its own is out of scope even when it is administratively part of the destination
-(for example Hội An is its own destination although it now belongs to Đà Nẵng city), unless that
+Every query targets places inside the destination itself. A nearby town that travellers visit as
+a destination of its own stays out of scope even when it is administratively part of the
+destination (Hội An is its own destination although it now belongs to Đà Nẵng city), unless that
 town is the destination.
 
-Return {\"queries\":[{\"group\": one requested group, \"query\": string}]} with exactly the
-requested count for each group. Allowed groups are FOOD_AND_DRINK and ATTRACTIONS (every sight:
-culture, temples, nature, beaches, markets, shopping, landmarks, entertainment); spread the
-ATTRACTIONS queries across those kinds."""
+Return {"queries":[{"group": one requested group, "query": string}]} with exactly the requested
+count for each group. Allowed groups: FOOD_AND_DRINK and ATTRACTIONS (every sight: culture,
+temples, nature, beaches, markets, shopping, landmarks, entertainment); spread the ATTRACTIONS
+queries across those kinds."""
 
-_RESEARCH_INSTRUCTIONS = """You are a travel web-research agent. You MUST use Web Search before
-answering. Search the Web for the supplied query, then read and cross-check at least the requested
-number of independent editorial, tourism-board, publication, or credible local-guide sources.
+_RESEARCH_INSTRUCTIONS = """You are a travel web-research agent. Use Web Search before answering: search for
+the supplied query, then read and cross-check at least the requested number of independent
+editorial, tourism-board, publication or credible local-guide sources.
 
-Return only places located in the destination itself. Leave out places in nearby towns or cities
-that travellers treat as a separate destination (for example Hội An for a Đà Nẵng trip), even when a
-source lists them as day trips. Give the street address when a source states it.
+Return only places located in the destination itself; a place in a nearby town that travellers
+treat as a separate destination (Hội An for a Đà Nẵng trip) stays out even when a source lists it
+as a day trip. Give the street address when a source states it.
 
-Do not use Google Maps, maps.google.com, a map listing, a generic business directory, or search
-result snippets as evidence. Extract only concrete places actually named by the sources. Do not
-invent a venue, address, coordinates, opening hours, rating, or dietary/accessibility claim. A
-place can be returned only if it has at least one matching source URL from the Web Search sources.
+Evidence is the text of the sources you read. Google Maps, maps.google.com, map listings,
+business directories and search-result snippets are not evidence. Extract only concrete places
+the sources name, with the venue name, address, coordinates, opening hours, rating and
+dietary/accessibility claims exactly as the sources give them (leave a field empty otherwise). A
+place qualifies only with at least one matching source URL from the Web Search sources.
 
 Return JSON only in this exact shape:
 {
-  \"sources\": [{\"url\": \"https://...\", \"title\": \"...\"}],
-  \"places\": [{
-    \"name\": \"...\", \"address\": \"... or empty\", \"category\": \"... or empty\",
-    \"reason\": \"short reason grounded in the sources and the traveller request\",
-    \"sourceUrls\": [\"https://...\"]
+  "sources": [{"url": "https://...", "title": "..."}],
+  "places": [{
+    "name": "...", "address": "... or empty", "category": "... or empty",
+    "reason": "short reason grounded in the sources and the traveller request",
+    "sourceUrls": ["https://..."]
   }]
 }
 """
 
 _CURATE_SYSTEM = """You curate cited Web discoveries for a trip planner. Return JSON only.
 
-Choose only candidateIds supplied in the evidence; never invent or rename a place. Keep diverse
-choices that fit the traveller request, including dietary rules, pace, children, older travellers,
-accessibility, budget and discovery style. Remove weak, duplicate, irrelevant, or poorly evidenced
-items. Return {\"candidateIds\":[\"...\"]}."""
+Choose candidateIds from the evidence as given (same ids, same names). Keep a diverse set that
+fits the traveller request, including dietary rules, pace, children, older travellers,
+accessibility, budget and discovery style; leave out weak, duplicate, irrelevant or poorly
+evidenced items. Return {"candidateIds":["..."]}."""
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -283,7 +284,9 @@ class WebResearcher:
                 "travellerRequest": self._request_context(),
                 "minimumIndependentSources": self.min_sources,
             }, ensure_ascii=False),
-            "tools": [{"type": "web_search", "search_context_size": "high"}],
+            # "medium": the page text the tool feeds back is ~90% of a job's input tokens at
+            # "high" (≈30k per query, measured 2026-10-12); three cited sources still fit.
+            "tools": [{"type": "web_search", "search_context_size": "medium"}],
             "tool_choice": "required",
             "include": ["web_search_call.action.sources"],
             "max_tool_calls": self.max_tool_calls,

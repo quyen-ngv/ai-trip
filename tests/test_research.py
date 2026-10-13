@@ -189,7 +189,7 @@ async def test_browser_request_requires_openai_web_search_and_returns_its_source
     assert response == web_response()
     assert captured["url"] == "https://api.openai.com/v1/responses"
     assert captured["headers"]["Authorization"] == "Bearer key"
-    assert captured["body"]["tools"] == [{"type": "web_search", "search_context_size": "high"}]
+    assert captured["body"]["tools"] == [{"type": "web_search", "search_context_size": "medium"}]
     assert captured["body"]["tool_choice"] == "required"
     assert captured["body"]["include"] == ["web_search_call.action.sources"]
     assert captured["body"]["text"]["format"]["type"] == "json_schema"

@@ -137,7 +137,7 @@ def normalize(row: dict, source: str = "db") -> dict:
                        if isinstance(url, str) and url.strip()][:3],
         "sourceTitles": [str(title)[:180] for title in (row.get("sourceTitles") or [])
                          if isinstance(title, str) and title.strip()][:3],
-        "menuHighlights": [str(m)[:40] for m in menu[:8]],
+        "menuHighlights": [str(m)[:40] for m in menu[:10]],
         "price": str(row.get("priceRange") or "").strip()[:16] or None,
         "tags": [str(tag)[:24] for tag in (row.get("tags") or []) if isinstance(tag, str) and tag.strip()][:12],
         "openHours": row.get("openHours") if isinstance(row.get("openHours"), dict) else None,
@@ -238,22 +238,36 @@ def shortage(rows: list[dict], pace: str | None, days: int, selected_groups: lis
 
 def research_needs(rows: list[dict], pace: str | None, days: int, selected_groups: list[str],
                    minimum_per_group: int) -> dict[str, int]:
-    """Return AI Web-research targets for one destination.
-
-    Research is an enrichment step, not merely an empty-catalogue fallback: every routable
-    destination searches food plus its requested activity groups. The capacity shortage still
-    increases the target when the local catalogue is thin.
-    """
+    """Return AI Web-research targets for one destination: only the groups the catalogue
+    cannot cover (`shortage`), each at least `minimum_per_group` rows so one search is worth
+    making. A destination the catalogue covers returns {} and is not researched at all
+    (2026-10-12 decision: paid Web search is a gap filler, not an enrichment step)."""
     minimum = max(1, int(minimum_per_group))
-    pace_name = (pace or "BALANCED").upper()
-    if pace_name == "RELAXED":
-        minimum = max(2, minimum - 1)
-    elif pace_name == "EAGER":
-        minimum += max(1, minimum // 2)
-    selected = [g for g in selected_groups if g in ACTIVITY_GROUPS]
-    groups = [FOOD, *(selected or ACTIVITY_GROUPS)]
     missing = shortage(rows, pace, days, selected_groups)
-    return {group: max(group_budget(group, minimum), missing.get(group, 0)) for group in dict.fromkeys(groups)}
+    return {group: max(minimum, count) for group, count in missing.items() if count > 0}
+
+
+def compact_for_select(r: dict, ref: str) -> dict:
+    """One catalogue row as the shortlist picker sees it: what tells whether the place fits
+    the traveller, in ~40 tokens. Rating is a tie-breaker, so it is kept but last."""
+    out: dict[str, Any] = {"id": ref, "title": r["title"]}
+    if r.get("subTypes"):
+        out["kinds"] = r["subTypes"][:4]
+    elif r.get("category"):
+        out["category"] = r["category"]
+    if r.get("description"):
+        out["desc"] = r["description"][:100]
+    if r.get("price"):
+        out["price"] = r["price"]
+    if r.get("tags"):
+        out["tags"] = r["tags"]
+    if is_food(r) and r.get("menuHighlights"):
+        out["menu"] = r["menuHighlights"][:10]    # dishes are the only hint for "muốn ăn phở"
+    if r.get("reviewRating"):
+        out["rating"] = round(r["reviewRating"], 1)
+    if r.get("reviewCount"):
+        out["reviews"] = r["reviewCount"]
+    return out
 
 
 _COUNTRY_SUFFIX = re.compile(r",?\s*(vietnam|việt nam|viet nam)\s*$", re.I)
@@ -277,7 +291,7 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     catalogue place, the cited reason for a Web one). The rest is what planning cannot do
     without: kind (meals vs sights, variety), location (routing), rating and review count
     (famous vs hidden gems), visit length, and the listing facts the profile rules depend on:
-    price band, tags (breakfast, kids, wheelchair, veg, halal...) and, for food, signature dishes."""
+    price band, tags (breakfast, kids, wheelchair, veg, halal...) and, for food, up to six signature dishes."""
     out: dict[str, Any] = {"id": ref, "title": r["title"]}
     address = short_address(r.get("address") or "")
     if address:
@@ -306,7 +320,7 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
     if r.get("tags"):
         out["tags"] = r["tags"]
     if is_food(r) and r.get("menuHighlights"):
-        out["menu"] = r["menuHighlights"][:6]
+        out["menu"] = r["menuHighlights"][:6]    # the shortlist call saw all 10; the planner names 1-2
     if r.get("source") == "web":
         # Citations stay on the row and reach the activity notes in code; the planner only
         # needs to know the stop is editorially recommended and whether it has a location.

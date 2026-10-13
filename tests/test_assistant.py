@@ -3,7 +3,8 @@ import json
 import pytest
 
 from app.assistant import graph as graph_module
-from app.assistant.graph import build_graph, clean_reply, initial_messages, parse_final, run_turn
+from app.assistant.graph import build_graph, clean_cards, clean_destinations, clean_reply, initial_messages, parse_final, run_turn
+from app.assistant.prompts import history_messages
 from app.assistant.tools import collect_names, step_for, tools_for
 
 PLACE = "11111111-1111-4111-8111-111111111111"
@@ -132,6 +133,40 @@ def test_clean_reply_bounds_everything():
     assert len(reply["markdown"]) == 8000 and len(reply["suggestions"]) == 4
 
 
+def test_clean_reply_keeps_an_extension_first_so_the_cap_never_drops_it():
+    adds = [{"action": "ADD", "placeId": f"p{i}", "dayNumber": 4} for i in range(6)]
+    reply = clean_reply({"answer": "ok", "proposals": adds + [{"action": "ADD_DAYS", "toDayNumber": "4"}]}, set(), {})
+    assert len(reply["proposals"]) == 6
+    assert reply["proposals"][0] == {"action": "ADD_DAYS", "toDayNumber": 4}
+
+
+def test_clean_reply_keeps_day_change_fields_and_drops_bad_ones():
+    reply = clean_reply({"answer": "ok", "proposals": [
+        {"action": "SHIFT_DATES", "startDate": "2026-11-08"},
+        {"action": "SHIFT_DATES", "startDate": "next week"},
+        {"action": "PREPEND_DAYS", "days": "2"},
+        {"action": "REPLACE", "activityId": "a1", "placeId": "p2", "startTime": "7pm"},
+        {"action": "RENAME_TRIP", "summary": "unknown actions are dropped"}]}, set(), {})
+    assert reply["proposals"][:3] == [{"action": "SHIFT_DATES", "startDate": "2026-11-08"},
+                                      {"action": "SHIFT_DATES"}, {"action": "PREPEND_DAYS", "days": 2}]
+    assert reply["proposals"][3] == {"action": "REPLACE", "activityId": "a1", "placeId": "p2"}
+    assert len(reply["proposals"]) == 4
+
+
+def test_a_place_shared_by_a_member_is_named_in_the_history():
+    turn = {**TURN, "history": [{"role": "user", "name": "Bình", "text": "[shared place p9]",
+                                 "places": [{"id": "p9", "name": "Chợ Hàn"}]}]}
+    messages = history_messages(turn)
+    assert messages[0]["content"] == "Bình: [shared place p9] [place: Chợ Hàn (p9)]"
+
+
+def test_budget_tool_needs_a_trip_only_in_the_direct_chat():
+    trip_budget = next(t for t in tools_for("TRIP") if t["function"]["name"] == "get_budget")
+    direct_budget = [t for t in tools_for("ASSISTANT") if t["function"]["name"] == "get_budget"]
+    assert trip_budget["function"]["parameters"]["required"] == []
+    assert len(direct_budget) == 1 and direct_budget[0]["function"]["parameters"]["required"] == ["trip_id"]
+
+
 def test_messages_put_static_rules_first_and_name_people():
     messages = initial_messages(TURN)
     assert messages[0]["role"] == "system" and "Pengoo" in messages[0]["content"]
@@ -144,11 +179,55 @@ def test_messages_put_static_rules_first_and_name_people():
 def test_direct_chat_gets_trip_tools_and_names_resolve():
     assert {t["function"]["name"] for t in tools_for("ASSISTANT")} >= {"list_my_trips", "get_trip"}
     assert "list_my_trips" not in {t["function"]["name"] for t in tools_for("TRIP")}
-    names, places = {}, set()
-    collect_names({"places": [{"id": PLACE, "name": "Quán A", "kind": "food"}], "trips": [{"id": "t9", "name": "Huế"}]},
-                  names, places)
-    assert places == {PLACE} and names["t9"] == "Huế"
+    names = {}
+    ids = {"place": set(), "event": set(), "meetup": set(), "trip": set()}
+    collect_names({"places": [{"id": PLACE, "name": "Quán A", "kind": "food"}],
+                   "trips": [{"id": "t9", "name": "Huế", "startDate": "2026-10-16"}]}, names, ids)
+    assert ids["place"] == {PLACE} and ids["trip"] == {"t9"} and names["t9"] == "Huế"
     assert step_for("get_trip", {"trip_id": "t9"}, names) == ("trip_details", {"name": "Huế"})
+
+
+def test_community_results_feed_cards_but_public_trips_never_become_open_buttons():
+    names = {}
+    ids = {"place": set(), "event": set(), "meetup": set(), "trip": set()}
+    collect_names({"trips": [{"id": "pt1", "name": "Đà Lạt 3 ngày", "kind": "trip"}],
+                   "latest": [{"id": "c1", "name": "Chợ đêm", "kind": "checkin", "placeId": "p7"}],
+                   "dishes": [{"id": "d1", "name": "Bánh căn", "kind": "dish", "citySlug": "da-lat"}]}, names, ids)
+    assert ids["public_trip"] == {"pt1"} and ids["trip"] == set()
+    assert ids["checkin"] == {"c1"} and ids["dish"] == {"d1"} and "p7" in ids["place"]
+    cards = clean_cards([{"type": "trip", "id": "pt1"}, {"type": "TRIP", "id": "pt1"}, {"type": "TRIP", "id": "made-up"},
+                         {"type": "CHECKIN", "id": "c1"}, {"type": "FOOD", "id": "d1"},
+                         {"type": "FOOD", "id": "d1", "citySlug": "da-lat"}, {"type": "PLACE", "id": "p7"}], ids)
+    assert cards == [{"type": "TRIP", "id": "pt1"}, {"type": "CHECKIN", "id": "c1"},
+                     {"type": "FOOD", "id": "d1", "citySlug": "da-lat"}]
+    reply = clean_reply({"answer": "x", "actions": [{"action": "OPEN_TRIP", "label": "Mở", "tripId": "pt1"}],
+                         "cards": [{"type": "TRIP", "id": "pt1"}]}, set(), {}, ids)
+    assert reply["actions"] == [] and reply["cards"] == [{"type": "TRIP", "id": "pt1"}]
+
+
+def test_destination_cards_need_an_explored_area_and_a_real_date_pair():
+    names = {}
+    ids = {"place": set(), "event": set(), "meetup": set(), "trip": set()}
+    collect_names({"destinations": [{"id": "hg", "name": "Hà Giang", "kind": "destination"},
+                                    {"id": "nb", "name": "Ninh Bình", "kind": "destination"}]}, names, ids)
+    cards = clean_destinations([{"id": "hg", "note": "Mùa tam giác mạch", "startDate": "2026-11-07",
+                                 "endDate": "2026-11-09"},
+                                {"id": "hg"}, {"id": "made-up"},
+                                {"id": "nb", "startDate": "tháng 11", "endDate": "2026-11-30"}], ids)
+    assert cards == [{"id": "hg", "note": "Mùa tam giác mạch", "startDate": "2026-11-07", "endDate": "2026-11-09"},
+                     {"id": "nb"}]
+    assert step_for("get_destination_guide", {"destination_id": "hg"}, names) == ("destination_guide",
+                                                                                  {"name": "Hà Giang"})
+    assert {"explore_destinations", "get_destination_guide"} <= {t["function"]["name"] for t in tools_for("TRIP")}
+
+
+def test_trip_scoped_community_tools_need_a_trip_only_in_the_direct_chat():
+    for name in ("get_trip_checkins", "rank_trip_places"):
+        trip_tool = next(t for t in tools_for("TRIP") if t["function"]["name"] == name)
+        direct_tool = next(t for t in tools_for("ASSISTANT") if t["function"]["name"] == name)
+        assert trip_tool["function"]["parameters"]["required"] == []
+        assert direct_tool["function"]["parameters"]["required"] == ["trip_id"]
+    assert step_for("search_meetups", {}, {}) == ("meetups", {})
 
 
 @pytest.mark.asyncio
@@ -184,3 +263,138 @@ async def test_reasoning_model_with_tools_retries_with_reasoning_off(monkeypatch
 
 async def _noop():
     return None
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_without_a_tool_call_is_not_posted_as_the_answer():
+    java = FakeJava()
+    model = ScriptedModel(
+        {"content": "Mình xem thời tiết ngày 2 để gợi ý nhé."},
+        {"content": "", "tool_calls": [tool_call("get_weather", {"day": 2})]},
+        {"content": '{"answer": "Ngày 2 nắng, đi Bà Nà buổi sáng."}'},
+    )
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+
+    assert java.tools == [("get_weather", {"day": 2})]
+    assert java.replies[0]["markdown"] == "Ngày 2 nắng, đi Bà Nà buổi sáng."
+    assert model.calls[1]["messages"][-1]["role"] == "system"      # the nudge
+    assert [s[0] for s in java.steps] == ["thought", "weather", "writing_answer"]
+
+
+@pytest.mark.asyncio
+async def test_plain_text_twice_is_accepted_as_the_answer():
+    java = FakeJava()
+    model = ScriptedModel({"content": "Xin chào!"}, {"content": "Xin chào bạn!"})
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert java.replies[0]["markdown"] == "Xin chào bạn!" and len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_actions_keep_only_ids_seen_and_memory_is_passed_on():
+    class EventJava(FakeJava):
+        async def tool(self, name, arguments):
+            self.tools.append((name, arguments))
+            return {"events": [{"id": "e1", "title": "Language exchange", "kind": "event"}]}
+
+    java = EventJava()
+    final = json.dumps({"answer": "Có buổi giao lưu nè", "memory": "  Thích cà phê yên tĩnh.  ", "actions": [
+        {"action": "OPEN_EVENT", "label": "Xem sự kiện", "eventId": "e1"},
+        {"action": "OPEN_EVENT", "label": "Bịa", "eventId": "e-invented"},
+        {"action": "OPEN_TRIP", "label": "Mở chuyến", "tripId": "trip1"},
+        {"action": "CREATE_TRIP", "label": "Tạo chuyến Huế", "city": "Huế", "startDate": "2026-10-16",
+         "endDate": "bad"},
+        {"action": "CREATE_TRIP", "label": "Thừa"}]}, ensure_ascii=False)
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_events", {"day": 2})]}, {"content": final})
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+
+    reply = java.replies[0]
+    assert reply["actions"] == [
+        {"action": "OPEN_EVENT", "label": "Xem sự kiện", "eventId": "e1"},
+        {"action": "OPEN_TRIP", "label": "Mở chuyến", "tripId": "trip1"},
+        {"action": "CREATE_TRIP", "label": "Tạo chuyến Huế", "city": "Huế"},
+    ]
+    assert reply["memory"] == "Thích cà phê yên tĩnh."
+
+
+@pytest.mark.asyncio
+async def test_web_search_is_offered_only_when_allowed_and_runs_once(monkeypatch):
+    from app.assistant import web_search
+
+    searched = []
+
+    async def fake_search(query):
+        searched.append(query)
+        return {"results": [{"title": "Blog", "url": "https://example.com", "snippet": "…"}]}
+
+    monkeypatch.setattr(web_search, "configured", lambda: True)
+    monkeypatch.setattr(web_search, "search", fake_search)
+    assert "web_search" not in {t["function"]["name"] for t in tools_for("TRIP")}
+
+    java = FakeJava()
+    turn = {**TURN, "limits": {"maxToolCalls": 4, "maxOutputTokens": 800, "webSearch": True}}
+    model = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("web_search", {"query": "board game Huế"}, "a"),
+                                       tool_call("web_search", {"query": "again"}, "b")]},
+        {"content": '{"answer": "Theo [Blog](https://example.com)…"}'},
+    )
+    graph = build_graph(turn, java, model)
+    await graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0})
+
+    assert "web_search" in {t["function"]["name"] for t in model.calls[0]["tools"]}
+    assert searched == ["board game Huế"]
+    assert java.tools == []                                          # never sent to Java
+    second = [m for m in model.calls[1]["messages"] if m.get("tool_call_id") == "b"][0]
+    assert "not available" in second["content"]
+
+    plain = FakeJava()
+    model = ScriptedModel({"content": '{"answer": "ok"}'})
+    await build_graph(TURN, plain, model).ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert "web_search" not in {t["function"]["name"] for t in model.calls[0]["tools"]}
+
+
+def test_earlier_cards_are_named_in_history_and_may_be_cards_again():
+    turn = {**TURN, "history": [{"role": "assistant", "text": "Hai quán nè",
+                                 "places": [{"id": PLACE, "name": "Cộng Cà Phê"}]}]}
+    messages = initial_messages(turn)
+    assert "Cộng Cà Phê (" + PLACE + ")" in messages[2]["content"]
+    reply = clean_reply({"answer": "x", "places": [{"placeId": PLACE}]}, {PLACE}, {})
+    assert reply["places"] == [{"placeId": PLACE, "note": None}]
+
+
+def test_memory_is_in_the_context():
+    messages = initial_messages({**TURN, "memory": "Khởi hành từ Đà Nẵng."})
+    assert "Khởi hành từ Đà Nẵng." in messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_openai_web_search_keeps_only_links_the_search_returned(monkeypatch):
+    from app.assistant import web_search
+
+    monkeypatch.setenv("CHEAP_LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("CHEAP_LLM_API_KEY", "k")
+    monkeypatch.setenv("CHEAP_LLM_MODEL", "m")
+    monkeypatch.delenv("ASSISTANT_WEB_SEARCH_PROVIDER", raising=False)
+    assert web_search.configured()
+    body = {"output": [
+        {"type": "web_search_call", "action": {"sources": [{"url": "https://real.vn/a", "title": "Real"}]}},
+        {"type": "message", "content": [{"type": "output_text", "text": json.dumps({"results": [
+            {"title": "Real", "url": "https://real.vn/a", "snippet": "Board game tối thứ Sáu"},
+            {"title": "Made up", "url": "https://fake.vn", "snippet": "x"}]})}]}]}
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return body
+
+    class Client:
+        async def post(self, url, headers=None, json=None):
+            assert url == "https://api.openai.com/v1/responses" and json["tools"][0]["type"] == "web_search"
+            return Response()
+
+    rows = await web_search._openai(Client(), "board game Huế")
+    assert rows == [{"title": "Real", "url": "https://real.vn/a", "snippet": "Board game tối thứ Sáu"}]

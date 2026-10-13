@@ -1,11 +1,15 @@
 """LangGraph pipeline for one AI trip job.
 
-validate -> retrieve -> web_research -> curate_web -> resolve_places -> plan -> verify -> commit
+validate -> retrieve -> [select_candidates | web_research] -> curate_web -> resolve_places
+         -> plan -> verify -> commit
 
 The AI owns the itinerary: ONE call per destination returns places, days, times, order, rest
-blocks and all wording. Code prepares a compact candidate shortlist, fetches the editable rules
+blocks and all wording. Before that, a cheap call reads the WHOLE catalogue of the destination
+and picks the rows that fit the traveller's request (free text included); code then only
+guards the shortlist (meals, diversity, pinned social rows, Web slots). Web research runs in
+parallel and only for the groups the catalogue cannot cover. Code fetches the editable rules
 from the `config` table, guards the result against what Java's commit rejects, and logs checks.
-If the model fails, a code-only fallback (scheduler.py) still produces a valid trip.
+If a model fails, a code-only fallback (quality ranking, scheduler.py) still produces a trip.
 """
 from __future__ import annotations
 import asyncio, logging, time
@@ -14,13 +18,15 @@ from typing import Any, TypedDict
 import httpx
 from langgraph.graph import StateGraph, START, END
 from . import ai_log, config
-from .candidates import (ALL_GROUPS, FOOD, bucket, diversity_key, group_budget, normalize_group, capacity, compact_for_plan, destination_dates,
-                         is_food, merge, normalize, pace_plan, quality, research_needs, row_key)
+from .candidates import (ALL_GROUPS, FOOD, bucket, diversity_key, group_budget, normalize_group, capacity, compact_for_plan,
+                         compact_for_select, destination_dates, is_food, merge, normalize, pace_plan, quality,
+                         research_needs, row_key)
 from .geo import WEEKDAYS, haversine_km
 from .itinerary import (add_time_estimates, append_missing_social_items, apply_social_texts, materialize,
                         social_trip_text)
 from .llm import CachedModel
-from .prompts import (CONFIG_LABEL, DEFAULT_DESCRIPTION_MAX_CHARS, KEY_DESCRIPTION_MAX_CHARS, build_itinerary_prompt)
+from .prompts import (DEFAULT_DESCRIPTION_MAX_CHARS, KEY_DESCRIPTION_MAX_CHARS, build_itinerary_prompt,
+                      build_select_prompt)
 from .research import WebResearcher
 from .scheduler import intercity_transport, schedule_destination
 from .validators import check, finalize, strip_internal
@@ -32,6 +38,7 @@ class State(TypedDict, total=False):
     job: dict[str, Any]
     cfg: dict[str, str]
     inventories: list[list[dict]]
+    selected: list[list[str]]
     raw_web: list[list[dict]]
     curated_web: list[list[dict]]
     items: list[dict]
@@ -169,16 +176,26 @@ def _located_first(row: dict) -> bool:
     return row.get("latitude") is not None
 
 
-def shortlist(rows: list[dict], pace: str | None, days: int) -> tuple[list[dict], list[dict]]:
+def shortlist(rows: list[dict], pace: str | None, days: int,
+              preferred: set[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Compact candidate set for the model: enough food for 3 meals/day with breakfast-capable
-    venues guaranteed, and activities spread across groups. Pure code, no LLM.
+    venues guaranteed, and activities spread across groups. No LLM call here.
+
+    `preferred` holds the row keys the cheap selection call judged to fit the traveller's
+    request; they rank ahead of everything else, and `quality` (rating, reviews, score) only
+    orders rows within the same tier. Without a selection (model failure) quality decides alone.
 
     Web-research rows carry no rating, so ranking by `quality` alone always put them last and
     a well-stocked catalogue cut every one of them. Up to a quarter of the food slots and a third
     of the activity slots are reserved for them (located rows first); the caps are unchanged."""
     cap = capacity(pace, days)
+    picked = preferred or set()
+
+    def rank(r: dict) -> tuple[bool, float]:
+        return (row_key(r) in picked, quality(r))
+
     social = [r for r in rows if r.get("source") == "social"]
-    food_all = sorted((r for r in rows if is_food(r)), key=quality, reverse=True)
+    food_all = sorted((r for r in rows if is_food(r)), key=rank, reverse=True)
     social_food = [r for r in social if is_food(r)]
     food_limit = max(16, cap["meals"] * 3)
     web_food = sorted((r for r in food_all if r.get("source") == "web"), key=_located_first, reverse=True)
@@ -201,7 +218,7 @@ def shortlist(rows: list[dict], pace: str | None, days: int) -> tuple[list[dict]
     web_acts = [r for r in web_acts if row_key(r) not in taken]
     taken |= {row_key(r) for r in web_acts}
     rest = [r for r in pool if row_key(r) not in taken]
-    acts += web_acts + _spread_by_group(rest, acts_limit - len(web_acts))
+    acts += web_acts + _spread_by_group(rest, acts_limit - len(web_acts), key=rank)
     return food, acts
 
 
@@ -330,8 +347,50 @@ async def build_workflow(job: dict[str, Any], token: str):
 
         return {"inventories": list(await asyncio.gather(*(one(i, d) for i, d in enumerate(dests))))}
 
+    async def select_candidates(s: State):
+        """Cheap model reads the whole catalogue of a destination and names the rows that fit
+        the request. Failure is not fatal: `shortlist` then ranks by quality alone."""
+        # Same stage as retrieve: the app maps it to "finding places", which this still is.
+        await java.event("RETRIEVING", 20, "ai_trip.selecting")
+
+        async def one(i: int) -> list[str]:
+            rows = [r for r in s["inventories"][i] if r.get("source") != "social"]
+            days = len(dest_dates[i])
+            if not rows or not days:
+                return []
+            cap = capacity(pace, days)
+            food_count = max(16, cap["meals"] * 3)
+            acts_count = max(14, int(cap["activities"] * 3))
+            refs: dict[str, str] = {}
+
+            def compact(group_rows: list[dict], prefix: str) -> list[dict]:
+                out_rows = []
+                for n, r in enumerate(group_rows, start=1):
+                    refs[f"{prefix}{n}"] = row_key(r)
+                    out_rows.append(compact_for_select(r, f"{prefix}{n}"))
+                return out_rows
+
+            food = [r for r in rows if is_food(r)]
+            acts = [r for r in rows if not is_food(r) and r["placeGroup"] != "ACCOMMODATION"]
+            if len(food) <= food_count and len(acts) <= acts_count:
+                return []     # nothing to cut: the planner sees every row anyway
+            name = dests[i].get("name") or req.get("cityName") or ""
+            system = build_select_prompt(req, locale, name, days, food_count, acts_count)
+            payload = {"food": compact(food, "f"), "activities": compact(acts, "a")}
+            out = await research_model.json(system, payload, max_tokens=2000, temperature=0.2, cache=False,
+                                            operation="SELECT_CANDIDATES")
+            if not isinstance(out, dict):
+                logger.warning("select %s: model gave no usable answer; ranking by quality", name)
+                return []
+            ids = [str(x) for key in ("food", "activities") for x in (out.get(key) or []) if isinstance(out.get(key), list)]
+            chosen = [refs[x] for x in ids if x in refs]
+            logger.info("select %s: %d food + %d activities offered, %d picked", name, len(food), len(acts), len(chosen))
+            return chosen
+
+        return {"selected": list(await asyncio.gather(*(one(i) for i in range(len(dests)))))}
+
     async def web_research(s: State):
-        inventories = list(s["inventories"])
+        inventories = s["inventories"]
         raw_web: list[list[dict]] = [[] for _ in dests]
 
         async def report(kind: str, params: dict):
@@ -340,17 +399,19 @@ async def build_workflow(job: dict[str, Any], token: str):
             except Exception as e:  # progress is best effort
                 logger.warning("event failed: %s", e)
 
-        # One TOTAL research budget for the whole job, split across every routable destination.
-        # AI-led Web research is mandatory even when the local catalogue is already sufficient.
+        # One TOTAL research budget for the whole job, split across the destinations whose
+        # catalogue is short (`research_needs` is empty when it is not — then no search at all).
         remaining = float(config.WEB_RESEARCH_BUDGET_SECONDS)
-        researching = [
-            (i, _research_destination_input(d, req.get("cityName") if i == 0 else None), research_needs(
-                inventories[i], pace, len(dest_dates[i]), selected,
-                config.WEB_RESEARCH_MIN_CANDIDATES_PER_GROUP,
-            ))
-            for i, d in enumerate(dests)
-            if dest_dates[i] and d.get("latitude") is not None and d.get("longitude") is not None
-        ]
+        researching = []
+        for i, d in enumerate(dests):
+            if not dest_dates[i] or d.get("latitude") is None or d.get("longitude") is None:
+                continue
+            needs = research_needs(inventories[i], pace, len(dest_dates[i]), selected,
+                                   config.WEB_RESEARCH_MIN_CANDIDATES_PER_GROUP)
+            if needs:
+                researching.append((i, _research_destination_input(d, req.get("cityName") if i == 0 else None), needs))
+            else:
+                logger.info("research %s: catalogue covers the stay, no Web search", d.get("name"))
         for pos, (i, d, needs) in enumerate(researching):
             if remaining <= 0:
                 logger.warning("research budget exhausted; skipping %s (%s)", d.get("name"), needs)
@@ -378,7 +439,7 @@ async def build_workflow(job: dict[str, Any], token: str):
                 raise RuntimeError(f"AI Web research timed out for {d.get('name') or 'destination'}") from exc
             remaining -= time.monotonic() - started
             raw_web[i] = rows
-        return {"inventories": inventories, "raw_web": raw_web}
+        return {"raw_web": raw_web}
 
     async def curate_web(s: State):
         await java.event("WEB_CURATING", 38, "ai_trip.web_curating")
@@ -438,7 +499,8 @@ async def build_workflow(job: dict[str, Any], token: str):
             chars = description_chars(max_chars, len(dates))
             day_numbers = [_day_number(first_start, x) for x in dates]
             weekdays = [WEEKDAYS[x.weekday()] for x in dates]
-            food, acts = shortlist(rows, pace, len(dates))
+            picked = set((s.get("selected") or [[]] * len(dests))[i])
+            food, acts = shortlist(rows, pace, len(dates), preferred=picked)
             first_note = last_note = ""
             if i > 0:
                 km = haversine_km(dests[i - 1], d)
@@ -496,7 +558,7 @@ async def build_workflow(job: dict[str, Any], token: str):
                     descriptions.append(desc)
             except ValueError as e:
                 logger.warning("AI itinerary unusable for %s (%s); using code-only fallback", d.get("name"), e)
-                dest_items, _, notes = schedule_destination(None, rows, day_numbers, dates, pace, center, locale, used,
+                dest_items, _, notes = schedule_destination(rows, day_numbers, dates, pace, center, locale, used,
                                                             first_day_delay=first_day_delay)
                 # No LLM wording in the fallback: use the place's own blurb, else a neutral line.
                 blurbs = {row_key(r): (r.get("description") or "") for r in rows}
@@ -556,15 +618,21 @@ async def build_workflow(job: dict[str, Any], token: str):
         return s
 
     graph = StateGraph(State)
-    nodes = [("validate", validate), ("retrieve", retrieve), ("web_research", web_research),
-             ("curate_web", curate_web), ("resolve_places", resolve_places), ("plan", plan),
-             ("verify", verify), ("commit", commit)]
-    for name, fn in nodes:
+    for name, fn in [("validate", validate), ("retrieve", retrieve), ("select_candidates", select_candidates),
+                     ("web_research", web_research), ("curate_web", curate_web), ("resolve_places", resolve_places),
+                     ("plan", plan), ("verify", verify), ("commit", commit)]:
         graph.add_node(name, fn)
-    graph.add_edge(START, nodes[0][0])
-    for (a, _), (b, _) in zip(nodes, nodes[1:]):
+    graph.add_edge(START, "validate")
+    graph.add_edge("validate", "retrieve")
+    # Selection and research both need only the catalogue, so they run side by side: the
+    # selection call is off the critical path whenever research runs at all.
+    graph.add_edge("retrieve", "select_candidates")
+    graph.add_edge("retrieve", "web_research")
+    graph.add_edge(["select_candidates", "web_research"], "curate_web")
+    for a, b in [("curate_web", "resolve_places"), ("resolve_places", "plan"), ("plan", "verify"),
+                 ("verify", "commit")]:
         graph.add_edge(a, b)
-    graph.add_edge(nodes[-1][0], END)
+    graph.add_edge("commit", END)
     return graph.compile()
 
 

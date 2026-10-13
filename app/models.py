@@ -25,9 +25,3 @@ class StartTurn(BaseModel):
     callbackBaseUrl: str
     limits: dict[str, Any] = Field(default_factory=dict)
     logPayloads: bool = True
-
-class CandidateQuery(BaseModel):
-    latitude: float
-    longitude: float
-    placeGroups: list[str] = Field(default_factory=list)
-    limit: int = 250

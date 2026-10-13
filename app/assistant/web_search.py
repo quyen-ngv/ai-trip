@@ -1,0 +1,141 @@
+"""Pengoo's last-resort internet search, used when the catalogue has nothing.
+
+Offered only when Java allows it for the turn (`limits.webSearch`, config ASSISTANT.WEB_SEARCH_ENABLED)
+and a provider is configured here; the graph allows one call per turn. Results are short snippets
+with their links. They never become place cards or proposals, because nothing in them is checked
+against the catalogue.
+
+Providers (ASSISTANT_WEB_SEARCH_PROVIDER):
+  openai (default)  The OpenAI Responses API with its built-in web_search tool, the same way the
+                    trip planner researches (`research.py`). Uses ASSISTANT_WEB_SEARCH_BASE_URL /
+                    _API_KEY / _MODEL, falling back to CHEAP_LLM_*. Logged to ai_api_calls.
+  tavily | brave    A search API; needs ASSISTANT_WEB_SEARCH_API_KEY.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from typing import Any
+
+import httpx
+
+from .. import ai_log
+from ..research import _output_text, _response_sources
+
+logger = logging.getLogger(__name__)
+
+MAX_RESULTS = 5
+SNIPPET_CHARS = 300
+TIMEOUT_SECONDS = 30
+_TAG = re.compile(r"<[^>]+>")
+
+_INSTRUCTIONS = """Search the web for the query and answer for a traveller in Vietnam. Return JSON only:
+{"results": [{"title": "...", "url": "https://...", "snippet": "the relevant fact in one or two sentences"}]}
+Use at most 5 results, only from pages you actually read, prefer recent and local sources, and keep
+each snippet factual (names, dates, address, price). No results → {"results": []}."""
+
+
+def _provider() -> str:
+    return os.getenv("ASSISTANT_WEB_SEARCH_PROVIDER", "openai").strip().lower() or "openai"
+
+
+def _openai_settings() -> tuple[str, str, str]:
+    def pick(key: str) -> str:
+        return os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() or os.getenv(f"CHEAP_LLM_{key}", "").strip()
+    return pick("BASE_URL").rstrip("/"), pick("API_KEY"), pick("MODEL")
+
+
+def configured() -> bool:
+    if _provider() == "openai":
+        return all(_openai_settings())
+    return bool(os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip())
+
+
+async def search(query: str) -> dict[str, Any]:
+    """{"results": [{title, url, snippet}], "note": ...} or {"error": ...}; never raises."""
+    query = (query or "").strip()[:200]
+    if not query:
+        return {"error": "query is required"}
+    if not configured():
+        return {"error": "Web search is not available."}
+    provider = _provider()
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+            if provider == "brave":
+                results = await _brave(client, query)
+            elif provider == "tavily":
+                results = await _tavily(client, query)
+            else:
+                results = await _openai(client, query)
+    except Exception as exc:  # network, quota, bad JSON
+        logger.warning("assistant web search failed (%s): %s", provider, exc)
+        return {"error": "Web search is unavailable right now."}
+    logger.info("assistant web search via %s: %d results", provider, len(results))
+    return {"results": results,
+            "note": "Unverified web snippets. Mention them as 'theo <source>' with the link; no cards, no proposals."}
+
+
+async def _openai(client: httpx.AsyncClient, query: str) -> list[dict]:
+    base_url, key, model = _openai_settings()
+    endpoint = base_url if base_url.endswith("/responses") else f"{base_url}/responses"
+    body = {"model": model, "instructions": _INSTRUCTIONS, "input": query,
+            "tools": [{"type": "web_search", "search_context_size": "low"}], "tool_choice": "required",
+            "include": ["web_search_call.action.sources"], "max_tool_calls": 2, "store": False}
+    started = time.monotonic()
+    value: Any = None
+    error: Any = None
+    try:
+        response = await client.post(endpoint, headers={"Authorization": f"Bearer {key}"}, json=body)
+        if response.status_code != 200:
+            error = {"httpStatus": response.status_code, "body": response.text[:4000]}
+            raise RuntimeError(f"HTTP {response.status_code}")
+        value = response.json()
+    finally:
+        input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
+        await ai_log.report(operation="WEB_SEARCH", provider=ai_log.provider_of(base_url), model=model,
+                            ok=value is not None, request=body, response=value, error=error,
+                            input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
+                            web_search_calls=searches, latency_ms=int((time.monotonic() - started) * 1000))
+    cited = _response_sources(value)
+    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", _output_text(value) or "").strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = {}
+    rows = [_row(item.get("title"), item.get("url"), item.get("snippet"))
+            for item in (parsed.get("results") if isinstance(parsed, dict) else None) or [] if isinstance(item, dict)]
+    # Only links the search really returned; a model may otherwise make one up.
+    rows = [row for row in rows if not cited or row["url"] in cited]
+    if not rows and cited:
+        rows = [_row(title, url, "") for url, title in list(cited.items())[:MAX_RESULTS]]
+    return rows[:MAX_RESULTS]
+
+
+async def _tavily(client: httpx.AsyncClient, query: str) -> list[dict]:
+    key = os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip()
+    response = await client.post("https://api.tavily.com/search",
+                                 headers={"Authorization": f"Bearer {key}"},
+                                 json={"query": query, "max_results": MAX_RESULTS, "search_depth": "basic",
+                                       "include_answer": False})
+    response.raise_for_status()
+    return [_row(item.get("title"), item.get("url"), item.get("content"))
+            for item in (response.json().get("results") or [])][:MAX_RESULTS]
+
+
+async def _brave(client: httpx.AsyncClient, query: str) -> list[dict]:
+    key = os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip()
+    response = await client.get("https://api.search.brave.com/res/v1/web/search",
+                                headers={"X-Subscription-Token": key, "Accept": "application/json"},
+                                params={"q": query, "count": MAX_RESULTS})
+    response.raise_for_status()
+    items = ((response.json().get("web") or {}).get("results")) or []
+    return [_row(item.get("title"), item.get("url"), item.get("description")) for item in items][:MAX_RESULTS]
+
+
+def _row(title: Any, url: Any, snippet: Any) -> dict:
+    text = " ".join(_TAG.sub("", str(snippet or "")).split())
+    return {"title": str(title or "")[:120], "url": str(url or ""),
+            "snippet": text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else "")}

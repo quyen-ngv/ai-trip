@@ -10,12 +10,8 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-# Java callback auth
-INTERNAL_TOKEN = os.getenv("AI_TRIP_INTERNAL_TOKEN", "")
-
 # Candidate retrieval
 CANDIDATES_PER_GROUP = _int("AI_TRIP_CANDIDATES_PER_GROUP", 120)
-CANDIDATE_RADIUS_KM = 50.0  # mirrors PlaceMapper.findActiveForAiWithinRadius
 
 # AI browser research. The same cheap model writes queries and invokes its Responses API
 # ``web_search`` tool; no separate browser provider credentials are required.

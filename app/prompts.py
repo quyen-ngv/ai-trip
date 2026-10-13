@@ -6,7 +6,16 @@ output contract, then validates the result against what the Java commit endpoint
 
 Rules live in the `config` table (label AI_TRIP) so product can tune them without a deploy;
 the DEFAULT_* constants below are the fallback AND the seed for that table
-(see goroute migration V148__ai_trip_prompt_config.sql — keep them in sync).
+(see goroute migrations V148__ai_trip_prompt_config.sql, V229, V235 — keep them in sync).
+
+Prompt layout (2026-10-13 rewrite, see .docs/AI_TRIP_PLANNING_KNOWLEDGE.md §E):
+- everything static first (identity, rules, input legend, output contract) so providers with
+  prefix caching bill it as cached input; the traveller profile and the task come last;
+- rules are phrased as what to do, grouped under short headers, about 45 atomic constraints
+  in total (instruction following degrades past ~50-100 for frontier models);
+- the planner names the area of each half-day before its stops (geographic cohesion is the
+  dimension LLM planners fail most), and the prompt ends with a six-line self-check that
+  repeats the hard constraints (recency).
 
 Field values must stay in sync with goroute_fe `create_ai_trip_screen.dart`:
 placeGroups, pace (RELAXED|BALANCED|EAGER), discoveryStyle (FAMOUS|BALANCED|HIDDEN_GEMS),
@@ -18,7 +27,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-CONFIG_LABEL = "AI_TRIP"
 KEY_PLAN_RULES = "PLAN_RULES"
 KEY_TRAVELLER_RULES = "TRAVELLER_RULES"
 KEY_DESCRIPTION_MAX_CHARS = "DESCRIPTION_MAX_CHARS"
@@ -36,70 +44,104 @@ LANG = {"vi": "Vietnamese", "en": "English"}
 # ----------------------------------------------------------------------------- default rules
 DEFAULT_PLAN_RULES = """\
 ## Core planning rules
-1. Use ONLY candidate ids from the input. Never invent a place. Never use a place twice in the whole trip.
-2. Every day: BREAKFAST (06:30-09:00), LUNCH (11:30-13:30), DINNER (18:00-20:30) — each at a real food venue.
-   - Breakfast = real breakfast food (phở, bún, bánh mì, xôi, cháo, bánh cuốn, cơm tấm...). NEVER a cafe/coffee/dessert place — nobody drinks coffee on an empty stomach.
-   - A cafe/dessert stop is a break AFTER a meal, at most one per day. Late-night food (ăn đêm, chè, night-market snacks) after dinner is welcome, especially for food lovers.
-   - Keep >= 3 hours between main meals. Vietnamese breakfast places sell out by ~09:30; many kitchens close 14:00-17:00.
-3. Geography: plan each half-day inside ONE area; consecutive stops must be close (use lat/lng). Never zig-zag across the city, never cross the city more than once a day. Budget realistic travel time between stops: walking ~4 km/h for < 1.5 km, otherwise taxi/Grab ~20 km/h in the city (~14 km/h in rush hours 07:00-09:00 and 16:00-18:00), plus 5-10 minutes to find a ride.
-4. Time-of-day fit (respect opening hours first when given):
-   - Temples/pagodas 06:30-09:30 or 16:00-17:30 · Museums/galleries daytime, ideal 11:00-15:00 as a heat refuge · Wet/morning markets 06:00-09:00
-   - Night markets, bars, rooftops, walking streets, shows: after 17:30 only · Beaches 06:00-09:00 or 16:00-18:30 · Viewpoints at sunrise or 60 min before sunset (sunset ~17:15 in Dec, ~18:30 in Jun)
-   - Waterfalls/nature/boat trips in the morning · Cable cars/mountain parks at opening or after 16:00 (clouds/rain after 10:00) · Theme parks: full day, arrive at opening
-   - Heat (Mar-Sep north/central, all year south): no long outdoor stop 11:00-15:00; put indoor/AC, lunch, cafe or a hotel rest there.
-5. Visit lengths: meal 45-90 min; temple 30-60; museum 90-150; market 45-90; beach 90-180; big park/cable car/theme park 240-420. Add a 10-15 min buffer after every stop.
-6. Rest blocks (no place) are allowed and encouraged when the traveller profile calls for them: {"rest":"hotel"} midday rest, {"rest":"walk"} a stroll in the neighbourhood, {"rest":"free"} free time.
-7. Never output transport items — travel is handled outside the plan.
-8. Discovery style: FAMOUS = mostly high-review-count landmarks; BALANCED = famous anchors + local favourites; HIDDEN_GEMS = local favourites with high ratings, one famous landmark per day for orientation.
-9. Cover the traveller's chosen interests across the trip (not all on one day); vary categories within a day (no three temples in a row); the user's own words override every default.
-10. Descriptions: a short practical guide per stop, written for this traveller (see "Writing each stop" below), grounded in the given data. Trip description: at most 2 short sentences. No marketing fluff, no invented facts.
-11. When social-video candidates are present, preserve their videoSequence order above every optimisation. Keep every social candidate in the itinerary, including unresolved candidates as ACTIVITY rows. If several rows share optionGroupId, output every row separately with the same slot/time; never merge or discard an option.
+1. Places: use only candidate ids from the input, each at most once in the whole trip. Every stop is a real candidate or a rest block.
+2. Meals, every day, each at a food candidate: BREAKFAST 06:30-09:00, LUNCH 11:30-13:30, DINNER 18:00-20:30, at least 3 hours apart.
+   - Breakfast is breakfast food (phở, bún, bánh mì, xôi, cháo, bánh cuốn, cơm tấm...) at a venue tagged breakfast or clearly serving it. A cafe or dessert place is a break after a meal (at most one per day), not a meal.
+   - Street breakfast sells out by ~09:30 and many kitchens pause 14:00-17:00; after 13:30 choose a restaurant, not a stall.
+   - Evenings in Vietnam continue after dinner: a night market, walking street, riverside or late-night snack (ăn đêm, chè) is the default evening block when the profile allows it.
+3. Geography: give each half-day ONE area and write it in the day's "area" field before the stops; consecutive stops are neighbours (use lat/lng), and the day crosses the city at most once. Travel time between stops: walking ~4 km/h up to 1.5 km, otherwise taxi/Grab ~20 km/h (~14 km/h in rush hours 07:00-09:00 and 16:00-18:00) plus 5-10 minutes to find a ride. Leave that gap between a stop's end and the next start.
+4. Opening hours first: arrive after opening, leave at least 30 minutes before closing; missing hours mean unknown, so keep such stops in mainstream daytime hours. Then time-of-day fit:
+   - Temples/pagodas at opening (06:30-09:00) or after 16:00 · Museums/galleries 09:00-17:00, ideal 11:00-15:00 as a heat refuge · Wet/morning markets 06:00-09:00
+   - Night markets, bars, rooftops, walking streets, shows after 17:30 · Beaches 06:00-09:00 or 16:00-18:30 · Viewpoints at sunrise or 60 min before sunset (~17:15 in Dec, ~18:30 in Jun)
+   - Waterfalls, nature, boat trips in the morning · Cable cars and mountain parks at opening or after 16:00 (cloud and rain after 10:00) · Theme parks: a full day from opening
+   - Heat (Mar-Sep north and centre, all year south): 10:30-15:30 is for indoor, shaded or air-conditioned stops, lunch, a cafe or a hotel rest; outdoor sights go before or after.
+5. Visit lengths at the place (travel excluded): meal 45-90 min; temple 30-60; museum 90-150; market 45-90; beach 90-180; big park, cable car or theme park 240-420. Add 10-15 minutes of slack after every stop.
+6. Rest blocks are stops without a place: {"rest":"hotel"} a midday rest, {"rest":"walk"} a stroll nearby, {"rest":"free"} free time. Use them when the profile asks for a slower day or the heat rule leaves a gap.
+7. Travel between cities is handled outside the plan: output places and rest blocks only.
+8. Discovery style: FAMOUS = mostly high-review-count landmarks; BALANCED = famous anchors plus local favourites; HIDDEN_GEMS = well-rated places with few reviews, plus one famous landmark per day for orientation.
+9. Variety: spread the traveller's interests across the days, vary kinds within a day (two temples in a row is enough), and let the traveller's own words win over every default here.
+10. Wording: each stop gets a short practical guide for this traveller (see "Writing each stop"); the trip description is at most 2 short sentences; everything is grounded in the given data, with no invented facts.
+11. Social-video itineraries: keep every social candidate, follow videoSequence above every other ordering rule, and output rows that share an optionGroupId as separate stops with the same time window (the user picks later).
 """
 
 DEFAULT_TRAVELLER_RULES = """\
 ## Rules by traveller profile (apply every matching block)
-### Pace
-- RELAXED: 2 non-meal stops/day, start 08:30, leisurely meals (90 min), a rest or free block midday, end by 21:30. Evenings still welcome (sunset, night market).
-- BALANCED: 3 non-meal stops/day, start 08:00, standard visits, end ~22:00. An evening activity is welcome.
-- EAGER: 4-5 non-meal stops/day, can start 06:00-07:00 (sunrise, morning markets) and end 23:00 (nightlife). Efficient transitions, quick meals.
+### Pace (non-meal stops per day; anchors are big sights, light stops are cafes, viewpoints, markets, walks)
+- RELAXED: 1 anchor + 1 light stop, start 08:30, long meals (90 min), a rest or free block midday, last stop ends by 21:30. Skeleton: breakfast → anchor → lunch → rest → light stop or sunset → dinner → optional evening stroll.
+- BALANCED: 2 anchors + 1 light stop, start 08:00, standard visits, last stop ends ~22:00. Skeleton: breakfast → anchor → light stop → lunch → indoor stop or cafe in the heat → anchor → sunset or evening block → dinner.
+- EAGER: 3 anchors + 1-2 light stops, start 06:00-07:00 for sunrise or a morning market, quick meals, last stop ends by 23:00 (nightlife allowed).
 ### Family with children (mobilityConsiderations contains Kid-friendly, or the group mentions children/kids/baby)
-- Max 3 stops/day, each <= 2 h; hotel rest 12:00-15:00 in hot months; dinner by 18:30; nothing after 20:00; walking <= 3 km/day.
-- NO adventure, extreme, trekking, cliffs, long boat rides, bars, nightlife or steep-stairs sites (e.g. Hang Múa, Fansipan summit steps, long hikes). Prefer parks, beaches at cool hours, interactive museums, water puppets, cable cars, gentle boats.
-- Babies/toddlers (0-3): 2 outdoor stops/day max, a nap block at the hotel is mandatory, stroller-friendly areas only.
-### Elderly / limited mobility (Elderly-friendly, or the group mentions elderly/parents/grandparents)
-- 2 stops/day with seating; <= 1 km walking per stop; midday rest 12:00-15:00; end by 19:30; door-to-door transport assumed.
-- Avoid steps-only sites, steep climbs, long standing, rough terrain, motorbike loops, sleeper buses. Seated sightseeing is ideal: cruises, rowing boats in the morning, cyclo, cable cars (stay at the station).
-### Couple / honeymoon
-- 2 stops + 1 "moment" per day: golden-hour viewpoint, riverside or beach sunset, a good dinner around 19:30, a spa/free block 13:00-16:00. Quieter alternatives over crowded spots; photo stops early morning (empty streets 06:30-08:00).
+- At most 3 stops/day, each 2 h or less; hotel rest 12:00-15:00 in hot months; dinner by 18:30; the day ends by 20:00; walking 3 km/day or less.
+- Choose parks, beaches at cool hours, interactive museums, water puppets, cable cars and gentle boats. Leave out adventure, trekking, cliffs, long boat rides, bars, nightlife and steep-stairs sites (Hang Múa, Fansipan summit steps, long hikes).
+- Babies and toddlers (0-3): 2 outdoor stops/day at most, a nap block at the hotel every day, stroller-friendly areas only.
+### Elderly or limited mobility (Elderly-friendly, or the group mentions elderly/parents/grandparents)
+- 2 stops/day with seating; 1 km of walking per stop at most; midday rest 12:00-15:00; the day ends by 19:30; door-to-door transport assumed.
+- Seated sightseeing is ideal: cruises, rowing boats in the morning, cyclo, cable cars (stay at the station). Leave out steps-only sites, steep climbs, long standing, rough terrain, motorbike loops and sleeper buses.
+### Couple or honeymoon
+- 2 stops + 1 "moment" per day: a golden-hour viewpoint, a riverside or beach sunset, dinner around 19:30, a spa or free block 13:00-16:00. Prefer quieter alternatives to crowded spots; photo stops early (empty streets 06:30-08:00).
 ### Friends group
-- Social dining, nightlife and photo spots welcome; next-day first stop >= 10:30 after a bar night; no dawn activities the morning after.
+- Social dining, nightlife and photo spots are welcome; after a bar night the next day starts at 10:30 or later with no dawn activity.
 ### Solo
-- Walkable areas, social cafes, safe neighbourhoods, easy public transport; bars/nightlife fine.
-### Adventure / trekking (activityTypes contains Adventure, or the user asks for trekking/hiking)
-- Start 06:00-07:30, finish all trekking/riding by 16:30; 20-30% time buffer; rest day after a big trek; never combine a trek with an intercity move on the same day. Skip entirely when children or elderly travel.
+- Walkable areas, social cafes, safe neighbourhoods, easy public transport; bars and nightlife are fine.
+### Adventure or trekking (activityTypes contains Adventure, or the user asks for trekking/hiking)
+- Start 06:00-07:30 and finish all trekking or riding by 16:30; keep a 20-30% time buffer; a lighter day follows a big trek; a trek and an intercity move never share a day. Skip this block when children or elderly travel.
 ### Photography
-- Put viewpoints/landmarks at sunrise or golden hour; markets and old streets before 08:00.
+- Viewpoints and landmarks at sunrise or golden hour; markets and old streets before 08:00.
 ### Food lovers (FOOD_AND_DRINK selected or the user talks about eating)
-- Named breakfast venue before 08:30, regional must-eat dishes, one evening food crawl (17:30-20:30) or late-night snack; use the menu highlights given.
+- A named breakfast venue before 08:30, the region's must-eat dishes across the days, one evening food crawl (17:30-20:30) or late-night snack; name real dishes from each venue's menu.
 ### Dietary restrictions
-- Hard constraint on every food venue. Vegetarian/vegan: prefer quán chay; halal: only venues that read as halal/seafood-safe; warn via description when a venue is uncertain.
-### Arrival / departure
-- First day of a destination after a move: start later (nothing before ~10:30 after a morning drive; a light day after an overnight train/bus). Last day: morning only if a move follows.
+- A hard constraint on every food venue: vegetarian/vegan need veg or vegan tags, kinds or a fitting menu (prefer quán chay); halal needs halal tags or a seafood-safe menu; say in the description when a venue needs checking.
+### Arrival and departure
+- First day of a destination after a move: start later (nothing before ~10:30 after a morning drive; a light day after an overnight train or bus). Last day before a move: morning only, free after lunch. Otherwise the traveller is already in town at the pace's start time.
 """
 
 DEFAULT_DESCRIPTION_MAX_CHARS = 600
 
 # Code-owned (not in the config table): how each stop is written. It follows the editable rules,
-# so it wins over an older one-sentence rule still stored there, and it is static text, so it
-# stays inside the cached prompt prefix.
+# and it is static text, so it stays inside the cached prompt prefix.
 STOP_WRITING_RULES = """\
-## Writing each stop (this overrides any shorter description rule above)
-- "stay": how many minutes a traveller like this one realistically spends AT the place (not travel), as [min, max], e.g. [45, 60] for a noodle shop, [90, 150] for a big museum. Make start/end fit it whenever the day allows.
-- "description": a mini-guide from a friend who knows the place. Lead with the most useful thing — what to do, see or order here, or why this time of day. Then add only the practical notes that truly matter for THIS stop and THIS traveller, for example: what to try or skip, where to stand for the view, how to get in, what to bring or wear (temples: cover shoulders and knees; beaches: sun cream, swim only at flagged zones), cash vs card, queues and quiet hours, booking, kids/elderly/wheelchair fit, dietary fit, weather or safety cautions.
-- Vary the shape from stop to stop so the plan reads naturally: one or two sentences; or a sentence plus up to 3 short lines starting with "• "; a market can get "what to look for", a viewpoint "when the light is best", a restaurant "what to order + one tip". Never a fixed template, never filler.
-- Accuracy over colour: use the candidate's own data (desc, menu, tags, price, hours, kinds) and stable, widely known facts about well-known places. When something is uncertain, give general advice ("weekends get crowded", "check today's hours before going") instead of a specific claim. Never invent prices, hours, ticket names, phone numbers or dishes that are not in the data.
-- Do not repeat the stop's name, address, start/end time or the "stay" estimate inside the description — the app shows those already.
-- Rest blocks: one short line on how to use the break."""
+## Writing each stop
+- "stay": minutes a traveller like this one spends AT the place (travel excluded), as [min, max], e.g. [45, 60] for a noodle shop, [90, 150] for a big museum; make start and end fit it when the day allows.
+- "description": a mini-guide from a friend who knows the place, in the traveller's language. Open with the most useful thing: what to do, see or order here, or why this time of day. Then only the practical notes that matter for THIS stop and THIS traveller: what to try or skip, where to stand for the view or the photo, how to get in and what a ticket costs when the data says so, what to bring or wear (temples: shoulders and knees covered; beaches: swim at flagged zones), cash or card, queues and quiet hours, booking, fit for kids, elderly, wheelchairs or the diet, weather or safety cautions.
+- Length and shape: 1-3 sentences for an ordinary stop, up to 5 for a day's anchor; a sentence plus up to 3 short "• " lines when a list reads better. Vary the shape from stop to stop; a market gets "what to look for", a viewpoint "when the light is best", a restaurant "what to order + one tip".
+- Accuracy over colour: use the candidate's own data (desc, menu, tags, price, hours, kinds) and stable, widely known facts about famous places. When unsure, give general advice ("weekends get crowded", "check today's hours") rather than a specific claim; prices, hours, ticket names, phone numbers and dishes come only from the data.
+- Leave out the stop's name, address, times and the stay estimate: the app shows them already.
+- Rest blocks: one short line on how to use the break.
+- Vietnamese text addresses the reader as "bạn" in a warm, friendly voice (never "quý khách"); English text addresses "you". Place names and dish names stay in their original spelling."""
+
+# Legend for the candidate rows; static, so it belongs to the cached prefix.
+INPUT_LEGEND = """\
+## Input
+JSON {"destination": "...", "days": [{"dayNumber", "date", "weekday"}], "food": [...], "activities": [...]}.
+Every food row is a food venue; every activity row is a sight or activity. Row fields (any may be missing):
+- id: short ref such as "f3" or "a7"; copy it exactly into the output
+- title, address (street and area)
+- hours: 24h local time for the trip's weekdays; "daily" = same every day; missing = unknown, not closed
+- desc: what the place is (for Web rows, why cited articles recommend it)
+- kinds: curated sub-types (BEACH, SPIRITUAL, MUSEUM, CAFE, HALAL, VEGETARIAN...) or category when there are none
+- rating, reviews, lat, lng, visitMin (typical visit minutes)
+- price: band per person such as "1-100k₫" or a level such as "affordable"
+- tags: facts from the venue's listing: meals served (breakfast, brunch, lunch, dinner, dessert, late_night), kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, groups, solo, view, rooftop, live_music, outdoor, reservation_required, touristy
+- menu (food only): signature dishes
+- source: "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography; "social_video" rows also carry videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus
+Treat price, tags and menu as facts: breakfast goes to breakfast-tagged venues or clear breakfast food; children prefer "kids" venues and skip alcohol-led bars; wheelchair users need "wheelchair"; diets need matching tags, kinds or menu; the budget is read from price."""
+
+OUTPUT_CONTRACT = """\
+## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
+{"tripDescription":"...","days":[{"dayNumber":1,"area":"morning area → afternoon area","stops":[
+  {"id":"f3","start":"07:30","end":"08:15","stay":[30,45],"description":"..."},
+  {"id":"a7","start":"08:30","end":"10:00","stay":[60,90],"description":"..."},
+  {"rest":"hotel","start":"12:30","end":"14:30","description":"..."}
+]}]}
+Times are local "HH:MM", chronological within a day, no overlaps, with the travel gap of rule 3 between stops."""
+
+SELF_CHECK = """\
+## Before answering, check every day
+- breakfast, lunch and dinner at food ids in their windows; breakfast is not a cafe
+- no id used twice in the trip; every id exists in the input; "area" named
+- stops chronological, inside opening hours, with travel gaps; no outdoor sight 10:30-15:30 in hot months
+- the hard constraints (dietary, mobility, children, elderly) and the traveller's own words are respected
+- the stop count matches the pace and the profile"""
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -115,6 +157,8 @@ def preferences_block(req: dict[str, Any], locale: str | None) -> str:
     lines.append(f"Pace: {(req.get('pace') or 'BALANCED').upper()}")
     if req.get("groupComposition"):
         lines.append(f"Group: {req['groupComposition']}")
+    if req.get("travelStyle"):
+        lines.append(f"Travel style: {req['travelStyle']}")
     lines.append(f"Discovery style: {(req.get('discoveryStyle') or 'BALANCED').upper()}")
     diet = req.get("dietaryRestrictions") or []
     if diet:
@@ -133,6 +177,27 @@ def preferences_block(req: dict[str, Any], locale: str | None) -> str:
     return "\n".join(lines)
 
 
+def build_select_prompt(req: dict[str, Any], locale: str | None, destination: str, days: int,
+                        food_count: int, activity_count: int) -> str:
+    """System prompt for the cheap shortlist call: pick the catalogue rows that fit THIS
+    traveller, from the whole catalogue, before the planning call sees them. Rating is only a
+    tie-breaker — a 4.8-star steakhouse is a wrong answer for a vegan request."""
+    return f"""You shortlist places for a trip planner. Return JSON only.
+
+## Input
+The full catalogue for {destination} ({days} days) as {{"food":[...],"activities":[...]}}. Row fields (any may be missing): id (short ref), title, kinds or category, desc, price, tags (facts from the listing: meals served = breakfast/lunch/dinner, kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, view, outdoor...), menu (food only: signature dishes), rating, reviews.
+
+## Task
+Pick exactly {food_count} food ids and exactly {activity_count} activity ids, in order of fit (all ids of a group when it has fewer). Decide in this order:
+1. The traveller's own words and hard constraints: a diet needs matching tags, kinds or menu; wheelchair needs the wheelchair tag or an obviously flat venue; children skip alcohol-led venues. Leave out anything that conflicts.
+2. Stated interests, travel style, discovery style and budget: a budget request takes cheap price bands; FAMOUS takes many reviews; HIDDEN_GEMS takes well-rated places with few reviews.
+3. Coverage of the whole stay: enough breakfast-capable venues for every morning (breakfast tag, or phở/bánh mì/xôi/cháo/bún-type dishes), lunch and dinner venues, and activities spread across kinds (nature, culture, markets, entertainment) so no kind dominates.
+4. Only then higher rating and review count.
+Use only ids from the input. Output: {{"food":["f3","f12",...],"activities":["a7",...]}}
+
+{preferences_block(req, locale)}"""
+
+
 def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination: str, days: int,
                            day_numbers: list[int], weekdays: list[str], cfg: dict[str, str],
                            first_day_note: str = "", last_day_note: str = "") -> str:
@@ -148,34 +213,28 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
         extra += f"\n- Day {day_numbers[-1]}: {last_day_note}"
     social = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else None
     if social:
-        extra += "\n- SOCIAL VIDEO PRIORITY: candidate order follows the source video. Preserve every candidate, and output options as separate stops sharing one time window. Every candidate has an id, even when it has no catalogue place."
-        extra += "\n- Write tripDescription and every description as the planner talking to the traveller: practical tips, what to do or eat, timing. Never mention a video, clip, creator or source, and never say the order is kept or follows anything."
+        extra += ("\n- SOCIAL VIDEO ITINERARY: videoSequence is the strongest ordering signal; keep every candidate "
+                  "(unresolved ones included), and output options sharing an optionGroupId as separate stops with one time window.")
+        extra += ("\n- Write tripDescription and every description as the planner talking to the traveller (tips, what to do or eat, timing); "
+                  "the words video, clip, creator and source stay out, and nothing says the order follows anything.")
         if social.get("durationBasis"):
             extra += f"\n- Social duration decision: {social['durationBasis']}"
-    # Static text first (identity, rules, input contract) and per-request text last, so providers
+    # Static text first (identity, rules, legend, contract) and per-request text last, so providers
     # with automatic prefix caching (DeepSeek, OpenAI) bill the shared prefix as cached input.
-    return f"""You are TripMind, an expert Vietnam travel planner. You produce the COMPLETE itinerary for one destination: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese.
+    return f"""You are Pengoo, an expert Vietnam travel planner. You produce the COMPLETE itinerary for one destination: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese.
 
 {plan_rules}
 {traveller_rules}
 {STOP_WRITING_RULES}
 
-## Input
-JSON {{"destination": "...", "days": [...], "food": [...], "activities": [...]}}. Every food candidate is a food venue; every activity candidate is a sight or activity. Each candidate: id (short ref, e.g. "f3"/"a7"), title, address (street and area), hours (24h local time for the trip's weekdays, "daily" = same every trip day; missing = unknown, not closed), desc (what the place is, or for Web rows why the cited articles recommend it), kinds (curated sub-types such as BEACH, SPIRITUAL, MUSEUM, CAFE, HALAL, VEGETARIAN) or category when there are no kinds, rating, reviews, lat, lng, visitMin, price (price band such as "1-100k₫" per person, or a level such as "affordable"), tags (facts from the venue's own listing: breakfast/brunch/lunch/dinner/dessert/late_night = meals it serves, kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, groups, solo, view, rooftop, live_music, outdoor, reservation_required, touristy), menu (food only: signature dishes). Any field may be missing.
-Treat price, tags and menu as facts: breakfast goes to venues tagged breakfast (or clearly breakfast food); children prefer "kids" venues and never "alcohol"-led bars; wheelchair users need "wheelchair"; dietary restrictions need veg/vegan/halal tags, kinds or a fitting menu; respect the budget through price. Name a real dish from menu in a food stop's description when it fits. source "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography. Social candidates may additionally include source "social_video", videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus.
+{INPUT_LEGEND}
 
-## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
-{{"tripDescription":"...","days":[{{"dayNumber":1,"stops":[
-  {{"id":"f3","start":"07:30","end":"08:15","stay":[30,45],"description":"..."}},
-  {{"id":"a7","start":"08:30","end":"10:00","stay":[60,90],"description":"..."}},
-  {{"rest":"hotel","start":"12:30","end":"14:30","description":"..."}}
-]}}]}}
-Every place stop uses the candidate's "id" exactly as given.
+{OUTPUT_CONTRACT}
 
 {preferences_block(req, locale)}
 
 ## Task
 Destination: {destination}. Plan {days} day(s): {day_list}.{extra}
-If this is a social-video itinerary, videoSequence is the strongest ordering signal. Do not reorder solely for rating, geography, meals, or opening hours. Keep alternative options as distinct stops (same optionGroupId and same time); the user can choose later.
-Fill every day from morning to evening according to the traveller profile. Times are local "HH:MM", chronological within a day, no overlaps, with realistic travel gaps between stops.
-Write all free text in {language(locale)}. Each stop description <= {max_chars} characters. tripDescription <= 2 short sentences."""
+Fill every day from morning to evening according to the traveller profile. Write all free text in {language(locale)}. Each stop description is at most {max_chars} characters; tripDescription at most 2 short sentences.
+
+{SELF_CHECK}"""

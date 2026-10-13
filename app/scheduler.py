@@ -56,7 +56,6 @@ class Stop:
 class DayPlan:
     day_number: int
     day_date: date
-    theme: str = ""
     stops: list[Stop] = field(default_factory=list)
 
     @property
@@ -84,69 +83,6 @@ def _default_minutes(r: dict, slot: str, pace: dict) -> int:
     if slot in MEAL_OF:
         return pace["meal"]
     return int(r.get("visitDurationMinutes") or pace["visit"])
-
-
-# --------------------------------------------------------------------- plan parsing
-def parse_plan(plan: Any, rows_by_id: dict[str, dict], day_numbers: list[int], dates: list[date],
-               pace: dict, used: set[str], locale: str = "vi") -> list[DayPlan]:
-    """Tolerant conversion of the model's JSON into DayPlans. Unknown ids, duplicates and
-    food/non-food slot mismatches are dropped here; gaps are filled later."""
-    by_day = {n: DayPlan(n, d) for n, d in zip(day_numbers, dates)}
-    days = (plan or {}).get("days") if isinstance(plan, dict) else None
-    rest_seq = 0
-    for d in days or []:
-        if not isinstance(d, dict):
-            continue
-        try:
-            n = int(d.get("dayNumber"))
-        except (TypeError, ValueError):
-            continue
-        if n not in by_day:
-            continue
-        by_day[n].theme = str(d.get("theme") or "")[:80]
-        snacks = night_food = 0
-        for s in d.get("stops") or []:
-            if not isinstance(s, dict):
-                continue
-            slot = str(s.get("slot") or "").upper()
-            if slot not in SLOTS:
-                continue
-            try:
-                minutes = int(s.get("minutes") or 0)
-            except (TypeError, ValueError):
-                minutes = 0
-            # rest / stroll / free-time blocks proposed by the model (no place attached)
-            rest = str(s.get("rest") or "").lower()
-            if rest in REST_KINDS:
-                rest_seq += 1
-                row = _rest_row(rest, locale, rest_seq)
-                if slot in MEAL_OF:
-                    slot = "AFTERNOON"
-                by_day[n].stops.append(Stop(row, slot, minutes if 30 <= minutes <= 180 else REST_KINDS[rest]["minutes"]))
-                continue
-            pid = str(s.get("candidateId") or s.get("placeId") or s.get("id") or "")
-            row = rows_by_id.get(pid)
-            if not row or row_key(row) in used:
-                continue
-            food = is_food(row)
-            if slot in MEAL_OF and not food:
-                slot = "MORNING" if slot == "BREAKFAST" else "AFTERNOON" if slot == "LUNCH" else "EVENING"
-            elif slot in MEAL_OF and food and slot == "BREAKFAST" and "snack" in _meals_of(row):
-                continue  # a cafe/dessert place is never breakfast; the real breakfast is filled later
-            elif slot not in MEAL_OF and food:
-                snackish = "snack" in _meals_of(row)
-                if slot == "EVENING" and night_food < 1:
-                    night_food += 1          # ăn đêm / chè / night-market food after dinner: allowed, one per day
-                elif slot in ("MORNING", "AFTERNOON") and snackish and snacks < 1:
-                    snacks += 1              # one cafe/dessert break per day, always after a meal by construction
-                else:
-                    continue
-            minutes = minutes if 20 <= minutes <= 360 else _default_minutes(row, slot, pace)
-            if slot in MEAL_OF:
-                minutes = min(minutes, 120)
-            by_day[n].stops.append(Stop(row, slot, minutes))
-            used.add(row_key(row))
-    return [by_day[n] for n in day_numbers]
 
 
 # --------------------------------------------------------------------- filling gaps
@@ -456,18 +392,16 @@ def intercity_transport(from_dest: dict, to_dest: dict, day_number: int, start_m
             "transportMode": intercity_mode(km), "startTime": fmt_time(start), "endTime": "08:00:00"}
 
 
-def schedule_destination(plan: Any, rows: list[dict], day_numbers: list[int], dates: list[date], pace_name: str | None,
+def schedule_destination(rows: list[dict], day_numbers: list[int], dates: list[date], pace_name: str | None,
                          center: dict, locale: str, used: set[str],
                          first_day_delay: int = 0) -> tuple[list[dict], list[DayPlan], list[str]]:
-    """Full pipeline for one destination: parse -> fill -> time -> items.
+    """Code-only itinerary for one destination (the fallback when the model's JSON is unusable):
+    fill -> time -> items.
     first_day_delay pushes the first day's start (arrival after an inter-city drive)."""
     pace = pace_plan(pace_name)
-    rows_by_id = {row_key(r): r for r in rows if row_key(r)}
-    rows_by_id.update({str(r["id"]): r for r in rows if r.get("id")})
-    rows_by_id.update({str(r["candidateId"]): r for r in rows if r.get("candidateId")})
     food_pool = sorted((r for r in rows if is_food(r)), key=combined_score, reverse=True)
     act_pool = sorted((r for r in rows if not is_food(r) and r["placeGroup"] != "ACCOMMODATION"), key=combined_score, reverse=True)
-    days = parse_plan(plan, rows_by_id, day_numbers, dates, pace, used, locale)
+    days = [DayPlan(n, d) for n, d in zip(day_numbers, dates)]
     notes: list[str] = []
     for idx, day in enumerate(days):
         start = pace["start"] + first_day_delay if idx == 0 and first_day_delay else None

@@ -24,19 +24,10 @@ def inventory():
     return food + acts
 
 
-def test_schedule_from_llm_plan_fills_meals_and_orders_times():
+def test_schedule_fills_meals_and_orders_times():
     rows = inventory()
-    plan = {"days": [
-        {"dayNumber": 1, "theme": "Old town", "stops": [
-            {"placeId": rows[0]["id"], "slot": "BREAKFAST", "minutes": 60},
-            {"placeId": rows[12]["id"], "slot": "MORNING", "minutes": 90},
-            {"placeId": rows[13]["id"], "slot": "AFTERNOON", "minutes": 120},
-            {"placeId": rows[20]["id"], "slot": "EVENING", "minutes": 60},
-        ]},
-        {"dayNumber": 2, "stops": [{"placeId": "not-a-real-id", "slot": "LUNCH", "minutes": 60}]},
-    ]}
     used = set()
-    items, days, notes = schedule_destination(plan, rows, [1, 2], [date(2026, 9, 7), date(2026, 9, 8)], "BALANCED", CENTER, "vi", used)
+    items, days, notes = schedule_destination(rows, [1, 2], [date(2026, 9, 7), date(2026, 9, 8)], "BALANCED", CENTER, "vi", used)
     visits = [i for i in items if i["type"] != "TRANSPORT"]
     for d in (1, 2):
         slots = [i["_slot"] for i in visits if i["dayNumber"] == d]
@@ -58,36 +49,16 @@ def test_schedule_from_llm_plan_fills_meals_and_orders_times():
     assert check(items, "BALANCED", 2) == []
 
 
-def test_schedule_without_plan_is_code_only_and_respects_opening_hours():
+def test_schedule_respects_opening_hours():
     rows = inventory()
     used = set()
-    items, days, notes = schedule_destination(None, rows, [1], [date(2026, 9, 7)], "EAGER", CENTER, "en", used)  # Monday
+    items, days, notes = schedule_destination(rows, [1], [date(2026, 9, 7)], "EAGER", CENTER, "en", used)  # Monday
     visits = [i for i in items if i["type"] != "TRANSPORT"]
     assert [i["_slot"] for i in visits if i["_slot"] in MEAL_OF] == ["BREAKFAST", "LUNCH", "DINNER"]
     museums = [i for i in visits if i["category"] == "attraction"]
     for m in museums:  # museums are open 8-17 on Monday: never scheduled at night
         assert m["endTime"] <= "17:00:00"
     assert visits[0]["startTime"] >= "07:00:00" and visits[-1]["endTime"] <= "23:00:00"
-
-
-def test_far_hop_gets_transport_and_rest_and_night_food_are_accepted():
-    rows = inventory()
-    far = normalize({"id": "00000000-0000-4000-8000-999999999999", "googlePlaceId": "gfar", "title": "Bà Nà Hills",
-                     "latitude": CENTER["latitude"] - 0.25, "longitude": CENTER["longitude"] - 0.15,
-                     "placeGroup": "ATTRACTIONS", "reviewRating": 4.6, "reviewCount": 50000, "visitDurationMinutes": 240})
-    night = rows[10]  # a food row
-    night["meals"] = ["snack"]
-    plan = {"days": [{"dayNumber": 1, "stops": [
-        {"placeId": rows[0]["id"], "slot": "BREAKFAST", "minutes": 60},
-        {"placeId": far["id"], "slot": "MORNING", "minutes": 240},
-        {"slot": "AFTERNOON", "rest": "hotel", "minutes": 90},
-        {"placeId": night["id"], "slot": "EVENING", "minutes": 45},
-    ]}]}
-    items, days, _ = schedule_destination(plan, rows + [far], [1], [date(2026, 9, 8)], "BALANCED", CENTER, "vi", set())
-    assert any(i["type"] == "TRANSPORT" for i in items)                      # >5 km hop gets a row
-    rest = [i for i in items if i["name"] == "Nghỉ ngơi tại khách sạn"]
-    assert rest and rest[0]["type"] == "ACTIVITY" and "placeId" not in rest[0] and "notes" not in rest[0]
-    assert any(i.get("_placeKey") == (night["id"] or night["googlePlaceId"]) for i in items)  # ăn đêm kept
 
 
 def test_cafe_never_fills_breakfast():
@@ -100,7 +71,7 @@ def test_cafe_never_fills_breakfast():
     acts = [normalize({"id": f"00000000-0000-4000-8000-00000000090{i}", "googlePlaceId": f"ga{i}", "title": f"Điểm {i}",
                        "latitude": CENTER["latitude"], "longitude": CENTER["longitude"],
                        "placeGroup": "CULTURE_AND_HERITAGE", "reviewRating": 4.4, "reviewCount": 500}) for i in range(3)]
-    items, _, _ = schedule_destination(None, [cafe, real] + acts, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "vi", set())
+    items, _, _ = schedule_destination([cafe, real] + acts, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "vi", set())
     breakfast = [i for i in items if i.get("_slot") == "BREAKFAST"]
     assert breakfast and breakfast[0]["name"] == "Bún bò O Hoa"  # the cafe lost despite far better rating
 
@@ -109,7 +80,7 @@ def test_google_only_rows_become_activity_items_with_google_name():
     rows = inventory()[:6]
     extra = normalize({"id": None, "googlePlaceId": "gX", "title": "Bà Nà Hills", "latitude": 15.9977, "longitude": 107.9880,
                        "placeGroup": "ATTRACTIONS", "reviewRating": 4.5, "reviewCount": 40000}, source="google")
-    items, _, _ = schedule_destination(None, rows + [extra], [1], [date(2026, 9, 9)], "RELAXED", CENTER, "en", set())
+    items, _, _ = schedule_destination(rows + [extra], [1], [date(2026, 9, 9)], "RELAXED", CENTER, "en", set())
     acts = [i for i in items if i["type"] == "ACTIVITY"]
     assert acts and acts[0]["name"] == "Bà Nà Hills" and "placeId" not in acts[0] and acts[0]["latitude"]
 
@@ -124,12 +95,7 @@ def test_scheduler_keeps_all_social_options_in_one_choice_window():
             relation="OPTION", resolutionStatus="RESOLVED"),
     ]
     options = [{**option, "source": "social"} for option in options]
-    plan = {"days": [{"dayNumber": 1, "stops": [
-        {"candidateId": "social-1", "slot": "LUNCH", "minutes": 60},
-        {"candidateId": "social-2", "slot": "LUNCH", "minutes": 60},
-    ]}]}
-
-    items, _, _ = schedule_destination(plan, options, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "en", set())
+    items, _, _ = schedule_destination(options, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "en", set())
     visits = [item for item in items if item["type"] != "TRANSPORT"
               and item.get("sourceSocialCandidateRef") in {"social-1", "social-2"}]
 
@@ -144,12 +110,7 @@ def test_scheduler_preserves_social_video_order_across_slots():
     second = row(202, "ATTRACTIONS", title="Video point two", candidateRef="social-2",
                  socialJobId="social-job", socialSequence=2, resolutionStatus="UNRESOLVED")
     rows = [{**first, "id": None, "source": "social"}, {**second, "id": None, "source": "social"}]
-    plan = {"days": [{"dayNumber": 1, "stops": [
-        {"candidateId": "social-2", "slot": "MORNING", "minutes": 60},
-        {"candidateId": "social-1", "slot": "AFTERNOON", "minutes": 60},
-    ]}]}
-
-    items, _, _ = schedule_destination(plan, rows, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "en", set())
+    items, _, _ = schedule_destination(rows, [1], [date(2026, 9, 8)], "BALANCED", CENTER, "en", set())
     visits = [item for item in items if item.get("sourceSocialCandidateRef")]
 
     assert [item["sourceSocialCandidateRef"] for item in visits] == ["social-1", "social-2"]
