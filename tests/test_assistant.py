@@ -133,6 +133,11 @@ def test_clean_reply_bounds_everything():
     assert len(reply["markdown"]) == 8000 and len(reply["suggestions"]) == 4
 
 
+def test_clean_reply_drops_a_copied_history_card_note():
+    answer = "Thẻ địa điểm ở dưới nhé.\n[place cards shown: My Khe Beach (ac1c24ff-7e2c)]"
+    assert clean_reply({"answer": answer}, set(), {})["markdown"] == "Thẻ địa điểm ở dưới nhé."
+
+
 def test_clean_reply_keeps_an_extension_first_so_the_cap_never_drops_it():
     adds = [{"action": "ADD", "placeId": f"p{i}", "dayNumber": 4} for i in range(6)]
     reply = clean_reply({"answer": "ok", "proposals": adds + [{"action": "ADD_DAYS", "toDayNumber": "4"}]}, set(), {})
@@ -398,3 +403,88 @@ async def test_openai_web_search_keeps_only_links_the_search_returned(monkeypatc
 
     rows = await web_search._openai(Client(), "board game Huế")
     assert rows == [{"title": "Real", "url": "https://real.vn/a", "snippet": "Board game tối thứ Sáu"}]
+
+
+def test_long_plain_text_is_an_answer_but_an_announcement_is_not():
+    from app.assistant.graph import looks_like_announcement
+    assert looks_like_announcement("Mình xem thời tiết ngày 2 để gợi ý nhé.")
+    assert looks_like_announcement("Let me check the weather for day 2 first.")
+    assert looks_like_announcement("Xin chào!")
+    long_answer = ("Vé thuyền Tràng An năm 2026 là **300.000đ/người lớn** (cao trên 1,3 m) và 150.000đ cho trẻ "
+                   "em cao 1–1,3 m; trẻ dưới 1 m miễn phí. Giá có thể thay đổi, bạn kiểm tra lại trước khi đi.")
+    assert not looks_like_announcement(long_answer)
+    assert looks_like_announcement(long_answer + " Để mình kiểm tra thêm giờ mở cửa nhé")
+    assert not looks_like_announcement("Phở Ngọc Béo mở 5:30–15:00.", acted=True)
+    assert looks_like_announcement("Mình xem thêm giờ mở cửa nhé.", acted=True)
+
+
+@pytest.mark.asyncio
+async def test_a_long_plain_text_answer_is_posted_without_a_second_round():
+    java = FakeJava()
+    answer = ("Vé thuyền Tràng An năm 2026 là **300.000đ/người lớn** (cao trên 1,3 m) và 150.000đ cho trẻ "
+              "em cao 1–1,3 m; trẻ dưới 1 m miễn phí. Giá có thể thay đổi, bạn kiểm tra lại trước khi đi.")
+    model = ScriptedModel({"content": answer})
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert len(model.calls) == 1
+    assert java.replies[0]["markdown"] == answer
+    assert [s[0] for s in java.steps] == ["writing_answer"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_json_answer_falls_back_to_the_text_round_before_it():
+    java = FakeJava()
+    model = ScriptedModel({"content": "Xin chào bạn, hôm nay mình giúp gì?"}, {"content": '{"answer": ""}'})
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert java.replies[0]["markdown"] == "Xin chào bạn, hôm nay mình giúp gì?"
+
+
+@pytest.mark.asyncio
+async def test_web_search_results_are_cached_per_query(monkeypatch, tmp_path):
+    from app.assistant import web_search
+
+    calls = []
+
+    async def fake_openai(client, query):
+        calls.append(query)
+        return [{"title": "Real", "url": "https://real.vn/a", "snippet": "300.000đ"}]
+
+    monkeypatch.setattr(web_search, "configured", lambda: True)
+    monkeypatch.setattr(web_search, "_provider", lambda: "openai")
+    monkeypatch.setattr(web_search, "_openai", fake_openai)
+    monkeypatch.setattr(web_search, "CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(web_search, "_cache", web_search.ResearchCache(str(tmp_path / "c.sqlite3")))
+    monkeypatch.setattr(web_search, "_cache_broken", False)
+
+    first = await web_search.search("giá vé Tràng An")
+    second = await web_search.search("Giá vé tràng an")
+    assert first["results"] == second["results"] and calls == ["giá vé Tràng An"]
+
+
+def test_places_named_in_the_answer_become_cards():
+    from app.assistant.graph import attach_mentioned_places, mentioned_places
+    found = {"p1": "Phở Ngọc Béo Phố Cổ", "p2": "Pho", "p3": "Trúc Bạch Lake", "p4": "Hoàn Kiếm Lake"}
+    answer = ("Nếu muốn ít đông, thử **hồ Trúc Bạch**. Còn phở thì ghé **Phở Ngọc Béo Phố Cổ**, "
+              "phở ở đây ngon.")
+    assert mentioned_places(answer, found) == ["p3", "p1"]          # "Pho" is too generic to match
+    final = attach_mentioned_places({"answer": answer, "places": [{"placeId": "p1", "note": "x"}]}, found)
+    assert final["places"] == [{"placeId": "p1", "note": "x"}, {"placeId": "p3"}]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_text_answer_after_a_search_still_shows_the_place_card():
+    class PlaceJava(FakeJava):
+        async def tool(self, name, arguments):
+            self.tools.append((name, arguments))
+            return {"places": [{"id": "d79a", "name": "Phở Ngọc Béo Phố Cổ", "kind": "food"},
+                               {"id": "31e9", "name": "Pho", "kind": "food"}]}
+
+    java = PlaceJava()
+    answer = ("Nếu muốn thử kiểu quán bình dân, bạn có thể ghé **Phở Ngọc Béo Phố Cổ**: giá khoảng "
+              "1.000–100.000đ, mở hằng ngày 5:30–15:00. Giá và giờ có thể thay đổi.")
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_places", {"query": "phở"})]},
+                          {"content": answer})
+    await build_graph(TURN, java, model).ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert java.replies[0]["markdown"] == answer
+    assert [p["placeId"] for p in java.replies[0]["places"]] == ["d79a"]

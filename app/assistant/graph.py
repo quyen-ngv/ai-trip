@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -42,8 +43,17 @@ CARD_POOLS = {"TRIP": ("public_trip", "trip"), "EVENT": ("event",), "MEETUP": ("
 MAX_MEMORY_CHARS = 1500
 NUDGE = ("Your last message was neither a tool call nor the final JSON, so the user would see nothing useful. "
          "If you meant to check something, call that tool now. Otherwise reply with the final JSON answer.")
+# A short plain-text round, or one that says what Pengoo is about to do, is an announcement and
+# gets the nudge. A longer plain-text round that reads as an answer is the answer: sending it back
+# only made the model repeat it as JSON (one more model round, and the text showed twice).
+ANNOUNCEMENT_MAX_CHARS = 160
+_ANNOUNCEMENT = re.compile(
+    r"^\W*(để mình|mình (sẽ|xem|tìm|kiểm tra|tra)|đợi mình|chờ mình|let me|i'll|i will|i am going to|i'm going to|one moment|hold on)\b"
+    r"|\b(nhé|nha|nhá)\W*$", re.I)
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.S)
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+# The history annotation (prompts.history_messages) that a model sometimes copies into its answer.
+_CARD_NOTE = re.compile(r"\s*\[(?:place cards shown|place): [^\]]*\]")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIME = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 PROPOSAL_ACTIONS = ("ADD", "MOVE", "UPDATE_TIME", "REMOVE", "REPLACE",
@@ -80,6 +90,71 @@ def parse_json(content: str) -> dict | None:
 def parse_final(content: str) -> dict:
     """The model's closing JSON; plain text (a model that ignored the format) becomes the answer."""
     return parse_json(content) or {"answer": _FENCE.sub("", content or "").strip()}
+
+
+# Words that say what a place is rather than which one it is. A name reduced to nothing but these
+# ("Pho", "Cafe") is too generic to recognise in an answer.
+_GENERIC_NAME_WORDS = {
+    "lake", "ho", "quan", "nha", "hang", "restaurant", "cafe", "coffee", "ca", "phe", "the", "a", "an", "and", "of",
+    "bar", "pub", "shop", "store", "market", "cho", "park", "cong", "vien", "temple", "chua", "den", "museum",
+    "bao", "tang", "hotel", "homestay", "khach", "san", "resort", "beach", "bien", "bai", "street", "pho",
+}
+_NAME_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _fold(text: str) -> str:
+    text = unicodedata.normalize("NFD", (text or "").lower().replace("đ", "d"))
+    return " ".join(_NAME_TOKEN.findall("".join(c for c in text if unicodedata.category(c) != "Mn")))
+
+
+def _distinctive(name: str) -> str | None:
+    """The part of a place name that identifies it, accent-free: "Trúc Bạch Lake" -> "truc bach".
+    None when what is left is too short to tell one place from another."""
+    tokens = _fold(name).split()
+    while tokens and tokens[0] in _GENERIC_NAME_WORDS:
+        tokens.pop(0)
+    while tokens and tokens[-1] in _GENERIC_NAME_WORDS:
+        tokens.pop()
+    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 5):
+        return None
+    return " ".join(tokens)
+
+
+def mentioned_places(answer: str, candidates: dict[str, str]) -> list[str]:
+    """Ids of catalogue places (id -> name) that the answer names, in the order they appear."""
+    text = f" {_fold(answer)} "
+    found: list[tuple[int, str]] = []
+    for place_id, name in candidates.items():
+        key = _distinctive(name)
+        if key:
+            at = text.find(f" {key} ")
+            if at >= 0:
+                found.append((at, place_id))
+    return [place_id for _, place_id in sorted(found)]
+
+
+def attach_mentioned_places(final: dict, candidates: dict[str, str], limit: int = 6) -> dict:
+    """Cards for catalogue places the answer names but the model left out of "places".
+
+    The model sometimes answers in plain text (or JSON without "places") right after a search, so
+    a catalogue place it recommends by name shows no card. Only places returned by this turn's
+    tools are candidates: they are real and public, and Java checks them again."""
+    places = [p for p in (final.get("places") or []) if isinstance(p, dict)]
+    have = {str(p.get("placeId") or p.get("id") or "") for p in places}
+    for place_id in mentioned_places(str(final.get("answer") or ""), candidates):
+        if len(places) >= limit:
+            break
+        if place_id not in have:
+            places.append({"placeId": place_id})
+            have.add(place_id)
+    return {**final, "places": places}
+
+
+def looks_like_announcement(content: str, acted: bool = False) -> bool:
+    """Plain text that is not yet an answer: phrased as "let me check", or short before any tool ran.
+    After a tool call a short text is usually the answer itself, so only the phrasing counts."""
+    text = (content or "").strip()
+    return bool(_ANNOUNCEMENT.search(text)) or (not acted and len(text) < ANNOUNCEMENT_MAX_CHARS)
 
 
 def clean_actions(raw: Any, ids: dict[str, set[str]]) -> list[dict]:
@@ -190,7 +265,7 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
     # A day change must survive the cap: the ADDs for new days are dropped without their extension.
     proposals.sort(key=lambda p: p["action"] not in _DAY_CHANGES)
     suggestions = [str(s).strip()[:120] for s in (final.get("suggestions") or []) if str(s).strip()][:4]
-    answer = str(final.get("answer") or "").strip()[:8000]
+    answer = _CARD_NOTE.sub("", str(final.get("answer") or "")).strip()[:8000]
     reply = {"markdown": answer, "places": places[:8], "proposals": proposals[:6], "suggestions": suggestions,
              "actions": clean_actions(final.get("actions"), ids or {}),
              "cards": clean_cards(final.get("cards"), ids or {}),
@@ -232,6 +307,9 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         ids["trip"].add(str(trip["id"]))
         if trip.get("name"):
             names[str(trip["id"])] = str(trip["name"])
+    # Places already in the chat or the trip are not offered again as cards by name; only what
+    # this turn's tools return is.
+    known_places = set(allowed_places)
 
     async def agent(state: State) -> State:
         budget_left = max_tool_calls - state.get("tool_calls", 0)
@@ -254,13 +332,21 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                 await java.step("thought", {}, content[:300])
             return {"messages": state["messages"] + [message], "usage": usage}
         final = parse_json(content)
-        if final is None and budget_left > 0 and not state.get("nudged"):
-            # Announced work without doing it, or ignored the format: one more round to act.
+        acted = state.get("tool_calls", 0) > 0
+        if final is None and budget_left > 0 and not state.get("nudged") and looks_like_announcement(content, acted):
+            # Announced work without doing it: one more round to act.
             if content:
                 await java.step("thought", {}, content[:300])
             return {"messages": state["messages"] + [message, {"role": "system", "content": NUDGE}],
                     "usage": usage, "nudged": True}
-        return {"messages": state["messages"] + [message], "usage": usage, "final": final or parse_final(content)}
+        final = final or parse_final(content)
+        if not str(final.get("answer") or "").strip():
+            # An empty JSON answer after a plain-text round: that text was the answer.
+            earlier = [m.get("content") for m in state["messages"]
+                       if m.get("role") == "assistant" and m.get("content") and not m.get("tool_calls")]
+            if earlier:
+                final["answer"] = _FENCE.sub("", earlier[-1]).strip()
+        return {"messages": state["messages"] + [message], "usage": usage, "final": final}
 
     async def run_tools(state: State) -> State:
         last = state["messages"][-1]
@@ -294,7 +380,9 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
 
     async def finish(state: State) -> State:
         await java.step("writing_answer", {})
-        await java.reply(clean_reply(state.get("final") or {}, allowed_places, state.get("usage") or {}, ids))
+        found = {pid: names[pid] for pid in allowed_places - known_places if pid in names}
+        final = attach_mentioned_places(state.get("final") or {}, found)
+        await java.reply(clean_reply(final, allowed_places, state.get("usage") or {}, ids))
         return {}
 
     def route(state: State) -> str:

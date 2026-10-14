@@ -22,8 +22,9 @@ from typing import Any
 
 import httpx
 
-from .. import ai_log
+from .. import ai_log, config
 from ..research import _output_text, _response_sources
+from ..research_cache import ResearchCache
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,26 @@ MAX_RESULTS = 5
 SNIPPET_CHARS = 300
 TIMEOUT_SECONDS = 30
 _TAG = re.compile(r"<[^>]+>")
+# One search call per question: the second call used to open a page the first had already
+# summarised, and OpenAI bills every call. Results are kept for a while: ticket prices, opening
+# hours and event dates do not change between two travellers asking the same thing.
+MAX_TOOL_CALLS = max(1, int(os.getenv("ASSISTANT_WEB_SEARCH_MAX_TOOL_CALLS", "1") or 1))
+CACHE_TTL_SECONDS = max(0, int(os.getenv("ASSISTANT_WEB_SEARCH_CACHE_TTL_SECONDS", str(3 * 24 * 3600)) or 0))
+_cache: ResearchCache | None = None
+_cache_broken = False
+
+
+def _cache_store() -> ResearchCache | None:
+    global _cache, _cache_broken
+    if CACHE_TTL_SECONDS <= 0 or _cache_broken:
+        return None
+    if _cache is None:
+        try:
+            _cache = ResearchCache(config.RESEARCH_CACHE_PATH)
+        except Exception as exc:  # unwritable path: search still works, uncached
+            logger.warning("assistant web search cache unavailable: %s", exc)
+            _cache_broken = True
+    return _cache
 
 _INSTRUCTIONS = """Search the web for the query and answer for a traveller in Vietnam. Return JSON only:
 {"results": [{"title": "...", "url": "https://...", "snippet": "the relevant fact in one or two sentences"}]}
@@ -62,6 +83,12 @@ async def search(query: str) -> dict[str, Any]:
     if not configured():
         return {"error": "Web search is not available."}
     provider = _provider()
+    store = _cache_store()
+    cache_key = ResearchCache.key("assistant-web-search-v1", {"provider": provider, "query": query.casefold()})
+    cached = store.get(cache_key) if store else None
+    if isinstance(cached, list) and cached:
+        logger.info("assistant web search via %s: %d cached results", provider, len(cached))
+        return _reply(cached)
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
             if provider == "brave":
@@ -74,6 +101,12 @@ async def search(query: str) -> dict[str, Any]:
         logger.warning("assistant web search failed (%s): %s", provider, exc)
         return {"error": "Web search is unavailable right now."}
     logger.info("assistant web search via %s: %d results", provider, len(results))
+    if store and results:
+        store.put(cache_key, results, CACHE_TTL_SECONDS)
+    return _reply(results)
+
+
+def _reply(results: list[dict]) -> dict[str, Any]:
     return {"results": results,
             "note": "Unverified web snippets. Mention them as 'theo <source>' with the link; no cards, no proposals."}
 
@@ -83,7 +116,8 @@ async def _openai(client: httpx.AsyncClient, query: str) -> list[dict]:
     endpoint = base_url if base_url.endswith("/responses") else f"{base_url}/responses"
     body = {"model": model, "instructions": _INSTRUCTIONS, "input": query,
             "tools": [{"type": "web_search", "search_context_size": "low"}], "tool_choice": "required",
-            "include": ["web_search_call.action.sources"], "max_tool_calls": 2, "store": False}
+            "include": ["web_search_call.action.sources"], "max_tool_calls": MAX_TOOL_CALLS, "store": False,
+            "reasoning": {"effort": "low"}}
     started = time.monotonic()
     value: Any = None
     error: Any = None
