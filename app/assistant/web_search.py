@@ -9,7 +9,12 @@ Providers (ASSISTANT_WEB_SEARCH_PROVIDER):
   openai (default)  The OpenAI Responses API with its built-in web_search tool, the same way the
                     trip planner researches (`research.py`). Uses ASSISTANT_WEB_SEARCH_BASE_URL /
                     _API_KEY / _MODEL, falling back to CHEAP_LLM_*. Logged to ai_api_calls.
+  tinyfish          TinyFish Search (free up to 12,000 a day, 30 a minute); title, url and snippet
+                    per result, no model call. Needs ASSISTANT_WEB_SEARCH_API_KEY.
   tavily | brave    A search API; needs ASSISTANT_WEB_SEARCH_API_KEY.
+
+A search API that fails (rate limit, outage) hands the query to OpenAI when CHEAP_LLM_* is set, so
+the traveller still gets an answer; the ASSISTANT_WEB_SEARCH_* values then belong to that API.
 """
 from __future__ import annotations
 
@@ -64,8 +69,13 @@ def _provider() -> str:
 
 
 def _openai_settings() -> tuple[str, str, str]:
+    # Behind another provider OpenAI is only the fallback, and ASSISTANT_WEB_SEARCH_* hold that
+    # provider's key, so it runs on the planner's CHEAP_LLM_* settings.
+    own = _provider() == "openai"
+
     def pick(key: str) -> str:
-        return os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() or os.getenv(f"CHEAP_LLM_{key}", "").strip()
+        value = os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() if own else ""
+        return value or os.getenv(f"CHEAP_LLM_{key}", "").strip()
     return pick("BASE_URL").rstrip("/"), pick("API_KEY"), pick("MODEL")
 
 
@@ -91,11 +101,12 @@ async def search(query: str) -> dict[str, Any]:
         return _reply(cached)
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-            if provider == "brave":
-                results = await _brave(client, query)
-            elif provider == "tavily":
-                results = await _tavily(client, query)
-            else:
+            try:
+                results = await _SEARCHERS.get(provider, _openai)(client, query)
+            except Exception as exc:
+                if provider == "openai" or not all(_openai_settings()):
+                    raise
+                logger.warning("assistant web search failed (%s), asking openai instead: %s", provider, exc)
                 results = await _openai(client, query)
     except Exception as exc:  # network, quota, bad JSON
         logger.warning("assistant web search failed (%s): %s", provider, exc)
@@ -167,6 +178,28 @@ async def _brave(client: httpx.AsyncClient, query: str) -> list[dict]:
     response.raise_for_status()
     items = ((response.json().get("web") or {}).get("results")) or []
     return [_row(item.get("title"), item.get("url"), item.get("description")) for item in items][:MAX_RESULTS]
+
+
+async def _tinyfish(client: httpx.AsyncClient, query: str) -> list[dict]:
+    key = os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip()
+    params = {"query": query}
+    started = time.monotonic()
+    response = await client.get("https://api.search.tinyfish.ai", headers={"X-API-Key": key}, params=params)
+    ok = response.status_code == 200
+    value = response.json() if ok else None
+    # Logged so the admin AI-calls page shows these searches too; no tokens, and free, so no
+    # web_search_calls count that the price table would flag as unpriced.
+    await ai_log.report(operation="WEB_SEARCH", provider="tinyfish", model="search", ok=ok, request=params,
+                        response=value, error=None if ok else {"httpStatus": response.status_code,
+                                                               "body": response.text[:4000]},
+                        latency_ms=int((time.monotonic() - started) * 1000))
+    response.raise_for_status()
+    items = (value or {}).get("results") or []
+    return [_row(item.get("title"), item.get("url"), item.get("snippet"))
+            for item in items if isinstance(item, dict) and item.get("url")][:MAX_RESULTS]
+
+
+_SEARCHERS = {"tinyfish": _tinyfish, "tavily": _tavily, "brave": _brave}
 
 
 def _row(title: Any, url: Any, snippet: Any) -> dict:

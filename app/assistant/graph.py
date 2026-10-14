@@ -228,6 +228,14 @@ def clean_destinations(raw: Any, ids: dict[str, set[str]]) -> list[dict]:
     return out
 
 
+def balance_bold(text: str) -> str:
+    """Drops a stray closing "**": with an odd count the app shows the asterisks as text."""
+    if text.count("**") % 2 == 0:
+        return text
+    cut = text.rfind("**")
+    return (text[:cut] + text[cut + 2:]).rstrip()
+
+
 def clean_reply(final: dict, allowed_places: set[str], usage: dict,
                 ids: dict[str, set[str]] | None = None) -> dict:
     """What Java receives: bounded lists, places only from this turn's tool results, earlier
@@ -265,7 +273,7 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
     # A day change must survive the cap: the ADDs for new days are dropped without their extension.
     proposals.sort(key=lambda p: p["action"] not in _DAY_CHANGES)
     suggestions = [str(s).strip()[:120] for s in (final.get("suggestions") or []) if str(s).strip()][:4]
-    answer = _CARD_NOTE.sub("", str(final.get("answer") or "")).strip()[:8000]
+    answer = balance_bold(_CARD_NOTE.sub("", str(final.get("answer") or "")).strip()[:8000])
     reply = {"markdown": answer, "places": places[:8], "proposals": proposals[:6], "suggestions": suggestions,
              "actions": clean_actions(final.get("actions"), ids or {}),
              "cards": clean_cards(final.get("cards"), ids or {}),

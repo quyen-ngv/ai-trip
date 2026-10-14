@@ -488,3 +488,65 @@ async def test_a_plain_text_answer_after_a_search_still_shows_the_place_card():
     await build_graph(TURN, java, model).ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
     assert java.replies[0]["markdown"] == answer
     assert [p["placeId"] for p in java.replies[0]["places"]] == ["d79a"]
+
+
+def test_a_stray_bold_marker_is_dropped():
+    from app.assistant.graph import balance_bold
+
+    assert balance_bold("Bạn thích núi hay sông hơn?**") == "Bạn thích núi hay sông hơn?"
+    assert balance_bold("**Mù Cang Chải** đẹp") == "**Mù Cang Chải** đẹp"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_search_returns_snippets(monkeypatch):
+    from app.assistant import web_search
+
+    monkeypatch.setenv("ASSISTANT_WEB_SEARCH_PROVIDER", "tinyfish")
+    monkeypatch.setenv("ASSISTANT_WEB_SEARCH_API_KEY", "tf-key")
+    assert web_search.configured()
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"results": [{"position": 1, "title": "Lễ hội", "url": "https://hue.vn/a",
+                                 "snippet": "<b>Festival</b> Huế 2026"},
+                                {"title": "No link"}]}
+
+        def raise_for_status(self):
+            pass
+
+    class Client:
+        async def get(self, url, headers, params):
+            assert url == "https://api.search.tinyfish.ai"
+            assert headers == {"X-API-Key": "tf-key"} and params == {"query": "festival Huế"}
+            return Response()
+
+    rows = await web_search._tinyfish(Client(), "festival Huế")
+    assert rows == [{"title": "Lễ hội", "url": "https://hue.vn/a", "snippet": "Festival Huế 2026"}]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_search_api_falls_back_to_openai(monkeypatch):
+    from app.assistant import web_search
+
+    monkeypatch.setenv("ASSISTANT_WEB_SEARCH_PROVIDER", "tinyfish")
+    monkeypatch.setenv("ASSISTANT_WEB_SEARCH_API_KEY", "tf-key")
+    monkeypatch.setenv("CHEAP_LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("CHEAP_LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("CHEAP_LLM_MODEL", "gpt-x")
+    monkeypatch.setattr(web_search, "CACHE_TTL_SECONDS", 0)
+    # The tinyfish key is not an OpenAI key: the fallback runs on CHEAP_LLM_*.
+    assert web_search._openai_settings() == ("https://api.openai.com/v1", "sk-test", "gpt-x")
+
+    async def rate_limited(client, query):
+        raise RuntimeError("HTTP 429")
+
+    async def fake_openai(client, query):
+        return [{"title": "Real", "url": "https://real.vn/a", "snippet": "300.000đ"}]
+
+    monkeypatch.setitem(web_search._SEARCHERS, "tinyfish", rate_limited)
+    monkeypatch.setattr(web_search, "_openai", fake_openai)
+    reply = await web_search.search("giá vé Tràng An")
+    assert reply["results"][0]["url"] == "https://real.vn/a"
