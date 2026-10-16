@@ -550,3 +550,14 @@ async def test_a_failing_search_api_falls_back_to_openai(monkeypatch):
     monkeypatch.setattr(web_search, "_openai", fake_openai)
     reply = await web_search.search("giá vé Tràng An")
     assert reply["results"][0]["url"] == "https://real.vn/a"
+
+
+def test_prose_followed_by_json_keeps_the_prose_as_the_answer():
+    content = ('Miền Trung tháng 10 thì **Huế** hợp nhất {nhé}.\n\nBạn muốn đi biển hay văn hóa?\n'
+               '{"destinations":[{"id":"d1","note":"Cố đô"}],"suggestions":["Gợi ý lịch trình Huế 2 ngày"]}')
+    final = parse_final(content)
+    assert final["answer"] == "Miền Trung tháng 10 thì **Huế** hợp nhất {nhé}.\n\nBạn muốn đi biển hay văn hóa?"
+    assert final["destinations"] == [{"id": "d1", "note": "Cố đô"}]
+    assert final["suggestions"] == ["Gợi ý lịch trình Huế 2 ngày"]
+    fenced = parse_final('Huế nhé!\n```json\n{"suggestions": ["Ăn gì?"]}\n```')
+    assert fenced == {"suggestions": ["Ăn gì?"], "answer": "Huế nhé!"}

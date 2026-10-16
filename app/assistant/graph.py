@@ -71,19 +71,51 @@ class State(TypedDict, total=False):
     usage: dict
 
 
+# Any of these makes a JSON object the reply's final format rather than data quoted in prose.
+_OUTPUT_KEYS = {"answer", "places", "proposals", "destinations", "cards", "actions", "suggestions", "memory"}
+_TRAILING_FENCE = re.compile(r"```(?:json)?\s*$")
+
+
 def parse_json(content: str) -> dict | None:
-    """The model's closing JSON object, or None when the content is not one."""
+    """The model's closing JSON object, or None when the content is not one.
+
+    Also the common slip of writing the answer as prose and only the cards, buttons and
+    follow-ups as JSON after it: the prose becomes the answer instead of the whole thing,
+    JSON included, reaching the user as text."""
     text = _FENCE.sub("", content or "").strip()
+    whole = _object(text)
+    if whole is not None:
+        return whole
+    trailing = _prose_then_json(text)
+    if trailing is not None:
+        return trailing
     match = _JSON_OBJECT.search(text)
-    for candidate in (text, match.group(0) if match else None):
-        if not candidate:
-            continue
+    return _object(match.group(0)) if match else None
+
+
+def _object(candidate: str) -> dict | None:
+    try:
+        value = json.loads(candidate)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) and _OUTPUT_KEYS & value.keys() else None
+
+
+def _prose_then_json(text: str) -> dict | None:
+    """Prose followed by one JSON object that runs to the end of the text."""
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start > 0:
         try:
-            value = json.loads(candidate)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(value, dict) and ("answer" in value or "places" in value or "actions" in value):
+            value, end = decoder.raw_decode(text, start)
+        except ValueError:
+            value, end = None, -1
+        if isinstance(value, dict) and _OUTPUT_KEYS & value.keys() and not _FENCE.sub("", text[end:]).strip():
+            prose = _TRAILING_FENCE.sub("", text[:start]).strip()
+            if prose and not str(value.get("answer") or "").strip():
+                value["answer"] = prose
             return value
+        start = text.find("{", start + 1)
     return None
 
 
