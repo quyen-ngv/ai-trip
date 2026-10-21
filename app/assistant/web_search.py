@@ -8,17 +8,20 @@ against the catalogue.
 Providers (ASSISTANT_WEB_SEARCH_PROVIDER):
   openai (default)  The OpenAI Responses API with its built-in web_search tool, the same way the
                     trip planner researches (`research.py`). Uses ASSISTANT_WEB_SEARCH_BASE_URL /
-                    _API_KEY / _MODEL, falling back to CHEAP_LLM_*. Logged to ai_api_calls.
+                    _API_KEY / _MODEL, falling back to the CHEAP_LLM tier. Logged to ai_api_calls.
+  claude            Claude's web_search tool through `providers.responses`. ASSISTANT_WEB_SEARCH_*
+                    as above, falling back to the CHEAP_LLM tier when it is Claude, else to
+                    ANTHROPIC_API_KEY with Claude's host and Haiku 5.5.
   tinyfish          TinyFish Search (free up to 12,000 a day, 30 a minute); title, url and snippet
                     per result, no model call. Needs ASSISTANT_WEB_SEARCH_API_KEY.
   tavily | brave    A search API; needs ASSISTANT_WEB_SEARCH_API_KEY.
 
-A search API that fails (rate limit, outage) hands the query to OpenAI when CHEAP_LLM_* is set, so
-the traveller still gets an answer; the ASSISTANT_WEB_SEARCH_* values then belong to that API.
+A search API that fails (rate limit, outage) hands the query to the CHEAP_LLM model (OpenAI or
+Claude) when that tier is set, so the traveller still gets an answer; the ASSISTANT_WEB_SEARCH_*
+values then belong to that API.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -27,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from .. import ai_log, config
+from .. import ai_log, anthropic_adapter, config, providers
 from ..research import _output_text, _response_sources
 from ..research_cache import ResearchCache
 
@@ -64,24 +67,34 @@ Use at most 5 results, only from pages you actually read, prefer recent and loca
 each snippet factual (names, dates, address, price). No results → {"results": []}."""
 
 
+_MODEL_PROVIDERS = ("openai", "claude", "anthropic")
+
+
 def _provider() -> str:
     return os.getenv("ASSISTANT_WEB_SEARCH_PROVIDER", "openai").strip().lower() or "openai"
 
 
-def _openai_settings() -> tuple[str, str, str]:
-    # Behind another provider OpenAI is only the fallback, and ASSISTANT_WEB_SEARCH_* hold that
-    # provider's key, so it runs on the planner's CHEAP_LLM_* settings.
-    own = _provider() == "openai"
+def _model_endpoint() -> providers.Endpoint:
+    """The model that searches. Behind a search API it is only the fallback, and
+    ASSISTANT_WEB_SEARCH_* hold that API's key, so it runs on the planner's CHEAP_LLM tier."""
+    cheap = providers.from_tiers("CHEAP_LLM")
+    provider = _provider()
+    if provider not in _MODEL_PROVIDERS:
+        return cheap
+    base = cheap
+    if provider != "openai" and not cheap.is_claude:
+        base = providers.Endpoint(anthropic_adapter.DEFAULT_BASE_URL, os.getenv("ANTHROPIC_API_KEY", "").strip(),
+                                  anthropic_adapter.DEFAULT_MODEL, "ANTHROPIC")
 
-    def pick(key: str) -> str:
-        value = os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() if own else ""
-        return value or os.getenv(f"CHEAP_LLM_{key}", "").strip()
-    return pick("BASE_URL").rstrip("/"), pick("API_KEY"), pick("MODEL")
+    def pick(key: str, fallback: str) -> str:
+        return os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() or fallback
+    return providers.Endpoint(pick("BASE_URL", base.base_url).rstrip("/"), pick("API_KEY", base.api_key),
+                              pick("MODEL", base.model), "ASSISTANT_WEB_SEARCH")
 
 
 def configured() -> bool:
-    if _provider() == "openai":
-        return all(_openai_settings())
+    if _provider() in _MODEL_PROVIDERS:
+        return _model_endpoint().configured
     return bool(os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip())
 
 
@@ -102,12 +115,12 @@ async def search(query: str) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
             try:
-                results = await _SEARCHERS.get(provider, _openai)(client, query)
+                results = await _SEARCHERS.get(provider, _model_search)(client, query)
             except Exception as exc:
-                if provider == "openai" or not all(_openai_settings()):
+                if provider in _MODEL_PROVIDERS or not _model_endpoint().configured:
                     raise
-                logger.warning("assistant web search failed (%s), asking openai instead: %s", provider, exc)
-                results = await _openai(client, query)
+                logger.warning("assistant web search failed (%s), asking the CHEAP_LLM model instead: %s", provider, exc)
+                results = await _model_search(client, query)
     except Exception as exc:  # network, quota, bad JSON
         logger.warning("assistant web search failed (%s): %s", provider, exc)
         return {"error": "Web search is unavailable right now."}
@@ -122,32 +135,20 @@ def _reply(results: list[dict]) -> dict[str, Any]:
             "note": "Unverified web snippets. Mention them as 'theo <source>' with the link; no cards, no proposals."}
 
 
-async def _openai(client: httpx.AsyncClient, query: str) -> list[dict]:
-    base_url, key, model = _openai_settings()
-    endpoint = base_url if base_url.endswith("/responses") else f"{base_url}/responses"
-    body = {"model": model, "instructions": _INSTRUCTIONS, "input": query,
+async def _model_search(client: httpx.AsyncClient, query: str) -> list[dict]:
+    """OpenAI Responses web_search, or Claude's web_search tool when the endpoint is Claude."""
+    body = {"instructions": _INSTRUCTIONS, "input": query,
             "tools": [{"type": "web_search", "search_context_size": "low"}], "tool_choice": "required",
             "include": ["web_search_call.action.sources"], "max_tool_calls": MAX_TOOL_CALLS, "store": False,
             "reasoning": {"effort": "low"}}
-    started = time.monotonic()
-    value: Any = None
-    error: Any = None
-    try:
-        response = await client.post(endpoint, headers={"Authorization": f"Bearer {key}"}, json=body)
-        if response.status_code != 200:
-            error = {"httpStatus": response.status_code, "body": response.text[:4000]}
-            raise RuntimeError(f"HTTP {response.status_code}")
-        value = response.json()
-    finally:
-        input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
-        await ai_log.report(operation="WEB_SEARCH", provider=ai_log.provider_of(base_url), model=model,
-                            ok=value is not None, request=body, response=value, error=error,
-                            input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
-                            web_search_calls=searches, latency_ms=int((time.monotonic() - started) * 1000))
+    result = await providers.responses(_model_endpoint(), body, operation="WEB_SEARCH",
+                                       timeout=TIMEOUT_SECONDS, client=client)
+    if not result.ok:
+        raise RuntimeError(f"web search failed: {result.error}")
+    value = result.value
     cited = _response_sources(value)
-    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", _output_text(value) or "").strip()
     try:
-        parsed = json.loads(text)
+        parsed = providers.parse_json(_output_text(value) or "")
     except ValueError:
         parsed = {}
     rows = [_row(item.get("title"), item.get("url"), item.get("snippet"))

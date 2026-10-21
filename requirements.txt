@@ -3,5 +3,11 @@ uvicorn[standard]==0.35.0
 httpx==0.28.1
 pydantic==2.11.7
 langgraph==0.6.6
+# Claude endpoints (app/anthropic_adapter.py). 1.x is the API the adapter was written against.
+anthropic>=1.17,<2
+faster-whisper>=1.1.0
+# PyAV 19 dropped av.open(metadata_errors=...), which faster-whisper 1.2.1 passes: every local
+# transcription then fails and returns an empty transcript.
+av<19
 pytest==8.4.1
 pytest-asyncio==1.1.0

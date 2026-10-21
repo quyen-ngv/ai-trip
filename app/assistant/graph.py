@@ -366,6 +366,9 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         calls = reply.get("tool_calls") or []
         content = (reply.get("content") or "").strip()
         message: dict[str, Any] = {"role": "assistant", "content": content or None}
+        if reply.get("_anthropic_content"):
+            # Claude's blocks go back verbatim next round: its thinking must return with tool results.
+            message["_anthropic_content"] = reply["_anthropic_content"]
         if calls:
             message["tool_calls"] = calls
             if content and not content.startswith("{"):

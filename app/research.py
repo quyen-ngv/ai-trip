@@ -17,9 +17,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import httpx
-
-from . import ai_log, config
+from . import ai_log, config, providers
 from .candidates import ACTIVITY_GROUPS, ATTRACTIONS, FOOD, LEGACY_ACTIVITY_GROUPS, group_budget, normalize
 from .llm import CachedModel
 from .research_cache import ResearchCache
@@ -128,9 +126,9 @@ def _output_text(response: dict[str, Any]) -> str:
 
 
 def _parse_json(text: str) -> dict[str, Any] | None:
-    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text or "", flags=re.S).strip()
+    # Claude may write a sentence around the JSON when it cites its sources.
     try:
-        value = json.loads(text)
+        value = providers.parse_json(text or "")
     except (TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -213,10 +211,6 @@ class WebResearcher:
     @property
     def enabled(self) -> bool:
         return bool(self.base_url and self.api_key and self.model and getattr(self.query_model, "configured", True))
-
-    @property
-    def endpoint(self) -> str:
-        return self.base_url if self.base_url.endswith("/responses") else f"{self.base_url}/responses"
 
     def _requested_query_count(self, target: int) -> int:
         # Bigger gaps get more independently phrased searches, bounded for predictable spend.
@@ -326,35 +320,15 @@ class WebResearcher:
                 },
             },
         }
-        started = time.monotonic()
-        value: Any = None
-        error: Any = None
-        try:
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=config.WEB_RESEARCH_TIMEOUT_SECONDS) as client:
-                response = await client.post(self.endpoint, headers=headers, json=body)
-            if response.status_code != 200:
-                error = {"httpStatus": response.status_code, "body": response.text[:4000]}
-                logger.warning("Web research failed (%s): %s", response.status_code, response.text[:400])
-                return None
-            value = response.json()
-            if not isinstance(value, dict):
-                error, value = {"reason": "response is not a JSON object"}, None
-                return None
-            input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
-            logger.info("Web research usage group=%s input=%s cached=%s output=%s searches=%d", group,
-                        input_tokens, cached, output_tokens, searches)
-            return value
-        except Exception as exc:
-            error = {"reason": type(exc).__name__, "message": str(exc)}
-            logger.warning("Web research request failed for %r: %s", query, exc)
+        result = await providers.responses(providers.Endpoint(self.base_url, self.api_key, self.model), body,
+                                           operation="WEB_SEARCH", timeout=config.WEB_RESEARCH_TIMEOUT_SECONDS)
+        if not result.ok:
+            logger.warning("Web research failed for %r: %s", query, result.error)
             return None
-        finally:
-            input_tokens, cached, output_tokens, searches = ai_log.responses_usage(value)
-            await ai_log.report(operation="WEB_SEARCH", provider=ai_log.provider_of(self.base_url), model=self.model,
-                                ok=value is not None, request=body, response=value, error=error,
-                                input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
-                                web_search_calls=searches, latency_ms=int((time.monotonic() - started) * 1000))
+        input_tokens, cached, output_tokens, searches = ai_log.responses_usage(result.value)
+        logger.info("Web research usage group=%s input=%s cached=%s output=%s searches=%d", group,
+                    input_tokens, cached, output_tokens, searches)
+        return result.value
 
     def _rows_from_response(self, response: dict[str, Any], group: str, known_titles: set[str]) -> list[dict]:
         result = _parse_json(_output_text(response))

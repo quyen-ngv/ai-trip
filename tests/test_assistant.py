@@ -238,6 +238,7 @@ def test_trip_scoped_community_tools_need_a_trip_only_in_the_direct_chat():
 @pytest.mark.asyncio
 async def test_reasoning_model_with_tools_retries_with_reasoning_off(monkeypatch):
     import httpx
+    from app import ai_log, providers
     from app.assistant import chat_model
 
     sent = []
@@ -251,10 +252,10 @@ async def test_reasoning_model_with_tools_retries_with_reasoning_off(monkeypatch
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
 
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(chat_model.httpx, "AsyncClient",
+    monkeypatch.setattr(providers.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    monkeypatch.setattr(chat_model, "_NO_REASONING_MODELS", set())
-    monkeypatch.setattr(chat_model.ai_log, "report", lambda **kw: _noop())
+    monkeypatch.setattr(providers, "_NO_REASONING_MODELS", set())
+    monkeypatch.setattr(ai_log, "report", lambda **kw: _noop())
     for key, value in {"BASE_URL": "https://llm.test/v1", "API_KEY": "k", "MODEL": "gpt-test"}.items():
         monkeypatch.setenv(f"ASSISTANT_LLM_{key}", value)
     tools = [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}]
@@ -401,7 +402,7 @@ async def test_openai_web_search_keeps_only_links_the_search_returned(monkeypatc
             assert url == "https://api.openai.com/v1/responses" and json["tools"][0]["type"] == "web_search"
             return Response()
 
-    rows = await web_search._openai(Client(), "board game Huế")
+    rows = await web_search._model_search(Client(), "board game Huế")
     assert rows == [{"title": "Real", "url": "https://real.vn/a", "snippet": "Board game tối thứ Sáu"}]
 
 
@@ -452,7 +453,7 @@ async def test_web_search_results_are_cached_per_query(monkeypatch, tmp_path):
 
     monkeypatch.setattr(web_search, "configured", lambda: True)
     monkeypatch.setattr(web_search, "_provider", lambda: "openai")
-    monkeypatch.setattr(web_search, "_openai", fake_openai)
+    monkeypatch.setattr(web_search, "_model_search", fake_openai)
     monkeypatch.setattr(web_search, "CACHE_TTL_SECONDS", 3600)
     monkeypatch.setattr(web_search, "_cache", web_search.ResearchCache(str(tmp_path / "c.sqlite3")))
     monkeypatch.setattr(web_search, "_cache_broken", False)
@@ -538,7 +539,8 @@ async def test_a_failing_search_api_falls_back_to_openai(monkeypatch):
     monkeypatch.setenv("CHEAP_LLM_MODEL", "gpt-x")
     monkeypatch.setattr(web_search, "CACHE_TTL_SECONDS", 0)
     # The tinyfish key is not an OpenAI key: the fallback runs on CHEAP_LLM_*.
-    assert web_search._openai_settings() == ("https://api.openai.com/v1", "sk-test", "gpt-x")
+    endpoint = web_search._model_endpoint()
+    assert (endpoint.base_url, endpoint.api_key, endpoint.model) == ("https://api.openai.com/v1", "sk-test", "gpt-x")
 
     async def rate_limited(client, query):
         raise RuntimeError("HTTP 429")
@@ -547,7 +549,7 @@ async def test_a_failing_search_api_falls_back_to_openai(monkeypatch):
         return [{"title": "Real", "url": "https://real.vn/a", "snippet": "300.000đ"}]
 
     monkeypatch.setitem(web_search._SEARCHERS, "tinyfish", rate_limited)
-    monkeypatch.setattr(web_search, "_openai", fake_openai)
+    monkeypatch.setattr(web_search, "_model_search", fake_openai)
     reply = await web_search.search("giá vé Tràng An")
     assert reply["results"][0]["url"] == "https://real.vn/a"
 

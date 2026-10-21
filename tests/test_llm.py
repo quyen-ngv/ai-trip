@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+from app import providers
 from app.llm import CachedModel
 
 
@@ -40,20 +41,13 @@ async def test_call_replaces_unsupported_max_tokens(monkeypatch):
             requests.append(json.copy())
             return responses.pop(0)
 
-    monkeypatch.setattr("app.llm.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
 
-    model = CachedModel.__new__(CachedModel)
-    model.url = "https://example.test"
-    model.key = "test-key"
-    model.prefix, model.model = "TEST", "gpt-5.6-terra"
+    endpoint = providers.Endpoint("https://example.test", "test-key", "gpt-5.6-terra", "TEST")
+    result = await providers.chat(endpoint, {"max_tokens": 123, "messages": []}, operation="TEST", timeout=5,
+                                  parse=providers.json_answer)
 
-    result = await model._call({
-        "model": "gpt-5.6-terra",
-        "max_tokens": 123,
-        "messages": [],
-    })
-
-    assert result == ({"ok": True}, False)
+    assert result.ok and result.value == {"ok": True}
     assert requests[0]["max_tokens"] == 123
     assert "max_completion_tokens" not in requests[0]
     assert "max_tokens" not in requests[1]
@@ -79,7 +73,7 @@ async def test_truncated_output_is_not_retried(monkeypatch):
             return httpx.Response(200, json={"choices": [{"message": {"content": '{"days": ['},
                                                           "finish_reason": "length"}]})
 
-    monkeypatch.setattr("app.llm.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
     monkeypatch.setenv("LLM_CACHE_PATH", ":memory:")
     for k, v in {"BASE_URL": "https://example.test", "API_KEY": "k", "MODEL": "m"}.items():
         monkeypatch.setenv(f"TRUNC_{k}", v)
@@ -106,7 +100,7 @@ async def test_each_call_is_reported_to_the_bound_sink(monkeypatch):
                 "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "prompt_cache_hit_tokens": 1000}})
 
-    monkeypatch.setattr("app.llm.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.providers.httpx.AsyncClient", FakeAsyncClient)
     monkeypatch.setenv("LLM_CACHE_PATH", ":memory:")
     for k, v in {"BASE_URL": "https://api.deepseek.com", "API_KEY": "k", "MODEL": "deepseek-chat"}.items():
         monkeypatch.setenv(f"SINK_{k}", v)

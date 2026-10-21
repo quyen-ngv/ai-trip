@@ -1,10 +1,12 @@
 """Report every AI provider call to Java's `ai_api_calls` log (prompt, response, usage, latency).
 
-`run_job` binds a sink for the job; model code calls `report(...)` without knowing about Java.
-Reporting is best effort: a failed report is logged and never fails the trip.
+Each entry point binds a sink for its job (trip, assistant turn, social video step); model code
+calls `report(...)` without knowing about Java. Reporting is best effort: a failed report is logged
+and never fails the job. Inline images and audio (base64) are replaced by a size marker so a row
+stays small.
 """
 from __future__ import annotations
-import logging, uuid
+import logging, re, uuid
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -14,12 +16,17 @@ logger = logging.getLogger(__name__)
 Sink = Callable[[dict[str, Any]], Awaitable[None]]
 _sink: ContextVar[Sink | None] = ContextVar("ai_call_sink", default=None)
 _feature: ContextVar[str] = ContextVar("ai_call_feature", default="AI_TRIP")
+_trace: ContextVar[str | None] = ContextVar("ai_call_trace", default=None)
+_DATA_URL = re.compile(r"data:[\w.+/-]+;base64,[A-Za-z0-9+/=]{64,}")
+_BASE64_RUN = re.compile(r"^[A-Za-z0-9+/=]{512,}$")
 
 
-def bind(sink: Sink | None, feature: str = "AI_TRIP"):
+def bind(sink: Sink | None, feature: str = "AI_TRIP", trace_id: str | None = None):
     """Route this context's reports (and tasks created from it) to `sink`, labelled `feature`
-    (AI_TRIP for trip planning, ASSISTANT for Pengoo's chat turns)."""
+    (AI_TRIP for trip planning, ASSISTANT for Pengoo's chat turns, SOCIAL_LOCATION for social
+    video extraction) and `trace_id` (the Java job a social step belongs to)."""
     _feature.set(feature)
+    _trace.set(trace_id)
     return _sink.set(sink)
 
 
@@ -53,6 +60,18 @@ def responses_usage(data: Any) -> tuple[int | None, int | None, int | None, int]
             usage.get("output_tokens"), searches)
 
 
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    if isinstance(value, str):
+        if _BASE64_RUN.match(value):
+            return f"<base64 {len(value)} chars>"
+        return _DATA_URL.sub(lambda m: f"<data-url {len(m.group())} chars>", value)
+    return value
+
+
 async def report(*, operation: str, provider: str, model: str, ok: bool, request: Any, response: Any = None,
                  error: Any = None, input_tokens: int | None = None, cached_input_tokens: int | None = None,
                  output_tokens: int | None = None, web_search_calls: int | None = None,
@@ -62,8 +81,8 @@ async def report(*, operation: str, provider: str, model: str, ok: bool, request
         return
     entry = {
         "feature": _feature.get(), "operation": operation, "correlationId": str(uuid.uuid4()),
-        "provider": provider, "model": model, "status": "SUCCEEDED" if ok else "FAILED",
-        "request": request, "response": response, "error": error,
+        "traceId": _trace.get(), "provider": provider, "model": model, "status": "SUCCEEDED" if ok else "FAILED",
+        "request": _redact(request), "response": _redact(response), "error": error,
         "inputTokens": input_tokens, "cachedInputTokens": cached_input_tokens, "outputTokens": output_tokens,
         "webSearchCalls": web_search_calls, "latencyMs": latency_ms,
     }

@@ -3,7 +3,7 @@ from datetime import date
 
 import pytest
 
-from app import research
+from app import providers, research
 from app.itinerary import materialize
 from app.research import WebResearcher
 
@@ -154,7 +154,7 @@ def test_web_research_reuses_the_cheap_model_responses_configuration():
     assert not researcher.enabled
     configured = WebResearcher(query_model=CheapModel())
     assert configured.enabled
-    assert configured.endpoint == "https://api.openai.com/v1/responses"
+    assert configured.base_url == "https://api.openai.com/v1"
     assert configured.api_key == "cheap-key" and configured.model == "cheap-web-model"
 
 
@@ -180,7 +180,7 @@ async def test_browser_request_requires_openai_web_search_and_returns_its_source
             captured.update(url=url, headers=headers, body=json)
             return Response()
 
-    monkeypatch.setattr(research.httpx, "AsyncClient", lambda **_: Client())
+    monkeypatch.setattr(providers.httpx, "AsyncClient", lambda **_: Client())
     researcher = WebResearcher(
         query_model=FakeQueryModel(), base_url="https://api.openai.com/v1", api_key="key", model="gpt-5",
     )

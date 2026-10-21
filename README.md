@@ -4,6 +4,23 @@ Internal worker that turns an AI-trip job from the Java backend into a saved iti
 Java owns auth, quota, the job row and SSE; this service only calls back into
 `/v1/api/internal/ai-trip-generations/{jobId}/{config|events|candidates|resolve-candidates|commit}`.
 
+It is also the AI service of the Python side: the Pengoo assistant (`app/assistant/`) and the model
+steps of social video extraction run here. Every chat / Responses call goes through `app/providers.py`
+(one transport, provider quirks, the `ai_api_calls` log); speech-to-text is `app/transcription.py`.
+A Claude endpoint (any tier, or a social job on `ANTHROPIC`/`CLAUDE`) runs through the official Anthropic
+SDK in `app/anthropic_adapter.py`, which translates OpenAI-shaped requests and answers both ways, keeps
+Claude's thinking blocks across Pengoo's tool rounds, and runs web research with Claude's `web_search`
+tool (`web_search_20250305` on Haiku, `web_search_20260209` elsewhere).
+google-maps-bot keeps the media work and calls, synchronously:
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /v1/social/transcribe` | the MP3 (`X-File-Name`) | `{transcript, provider}` |
+| `POST /v1/social/prefilter` | `{metadata, transcript, language, aiProvider?, aiModel?, aiBaseUrl?}` | `{rejection: null | {reason, provider, model, usage}}` |
+| `POST /v1/social/extract` | the same plus `transcriptProvider`, `images` (data URLs in video order) | `{extraction, provider, model, usage}`; 422/502 with `detail` |
+
+All take `X-Internal-Token` and, to log under the Java job, `X-Ai-Log-Url`, `X-Ai-Log-Token`, `X-Trace-Id`.
+
 ## Design: the AI owns the plan
 
 **One LLM call per destination** returns the complete itinerary — which places, which day, what
@@ -86,6 +103,13 @@ How the prompt is built (2026-10-13; research in `.docs/AI_TRIP_PLANNING_KNOWLED
 | `AI_TRIP_WEB_CURATION_MAX_PER_GROUP` | Maximum Web candidates sent per group to Java identity resolution (default 12). |
 | `AI_TRIP_CANDIDATES_PER_GROUP` | `/candidates` limit per group (default 120). |
 | `AI_TRIP_LLM_TIMEOUT_SECONDS` | HTTP timeout for the planning call (default 180). |
+| `CHEAP_LLM_PROVIDER`, `QUALITY_LLM_PROVIDER`, `ASSISTANT_LLM_PROVIDER` | `anthropic` (or `claude`) makes that tier Claude: only `_API_KEY` is then required; `_BASE_URL` defaults to `https://api.anthropic.com` and `_MODEL` to `claude-haiku-5-5`. A tier whose `_BASE_URL` is on api.anthropic.com is Claude too. Claude ignores `temperature` and `response_format`; JSON comes from the prompts. |
+| `ASSISTANT_WEB_SEARCH_PROVIDER` | `openai` (default), `claude`, `tinyfish`, `tavily` or `brave`. `claude` searches with Claude using `ASSISTANT_WEB_SEARCH_*`, else the CHEAP_LLM tier when it is Claude, else `ANTHROPIC_API_KEY` with Haiku 5.5. |
+| `AI_PROVIDER` / `AI_MODEL` / `AI_BASE_URL` | Social video defaults when the job names none (`ANTHROPIC`, `DEEPSEEK`, `OPENAI`, `OPENAI_COMPATIBLE`). |
+| `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `AI_API_KEY` | Provider keys for social video calls (`AI_API_KEY` = OPENAI_COMPATIBLE). Defaults: `OPENAI_CHAT_MODEL` (gpt-6-luna), `CLAUDE_MODEL` (claude-haiku-5-5), `DEEPSEEK_BASE_URL`. |
+| `AI_REQUEST_TIMEOUT_SECONDS` / `SOCIAL_AI_REASONING_EFFORT` | Social extraction timeout (default 120; pre-filter at most 30) and the OpenAI reasoning effort override. |
+| `GROQ_API_KEY` / `GROQ_WHISPER_MODEL`, `OPENAI_WHISPER_MODEL` | Speech-to-text: Groq first, then OpenAI, then local Whisper. |
+| `LOCAL_WHISPER_*` | `ENABLED` (true), `MODEL` (small, baked in the image), `DEVICE` (cpu), `COMPUTE_TYPE` (int8), `LANGUAGE` (vi), `CACHE_DIR`, `BEAM_SIZE` (1), `CPU_THREADS` (2). |
 | `LOG_LEVEL` | Default INFO. Prompts and payloads are not logged, only their sizes and the provider's token `usage` (`LLM usage ...`, `Web research usage ...`). |
 
 ## Multi-destination trips

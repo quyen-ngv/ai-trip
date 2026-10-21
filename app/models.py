@@ -11,6 +11,22 @@ class StartJob(BaseModel):
     callbackBaseUrl: str = Field(validation_alias=AliasChoices(
         "callbackBaseUrl", "callback_base_url", "callbackUrl", "callback_url"))
 
+class SocialStep(BaseModel):
+    """One model step of a social video job, sent by google-maps-bot. The provider fields are the
+    job's admin choice (SOCIAL_LOCATION.AI_PROVIDER / AI_MODEL); empty means the .env defaults."""
+    aiProvider: str | None = None
+    aiModel: str | None = None
+    aiBaseUrl: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    transcript: str = ""
+    language: str = "vi"
+
+
+class SocialExtract(SocialStep):
+    transcriptProvider: str = ""
+    images: list[str] = Field(default_factory=list)  # data URLs, in video order
+
+
 class StartTurn(BaseModel):
     """One question to Pengoo, sent by Java (AssistantContextBuilder)."""
     model_config = ConfigDict(extra="allow")

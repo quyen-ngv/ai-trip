@@ -1,14 +1,12 @@
-"""Thin OpenAI-compatible chat client with JSON output and an optional SQLite cache."""
+"""A configured model tier with JSON output and an optional SQLite cache, for the trip planner."""
 from __future__ import annotations
-import asyncio, hashlib, json, logging, os, re, sqlite3, time
+import asyncio, hashlib, json, logging, os, sqlite3
 from pathlib import Path
 from typing import Any
-import httpx
-from . import ai_log
+from . import providers
 from .config import LLM_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
-_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.S)
 
 
 class CachedModel:
@@ -19,26 +17,29 @@ class CachedModel:
     """
 
     def __init__(self, prefix: str, fallback_prefix: str | None = None):
-        chosen = prefix
-        if not self._configured(prefix) and fallback_prefix and self._configured(fallback_prefix):
-            chosen = fallback_prefix
-        self.prefix = chosen
-        self.url = os.getenv(f"{chosen}_BASE_URL", "").rstrip("/")
-        self.key = os.getenv(f"{chosen}_API_KEY", "")
-        self.model = os.getenv(f"{chosen}_MODEL", "")
-        logger.info("LLM %s -> %s model=%s configured=%s", prefix, chosen, self.model, self.configured)
+        self.endpoint = providers.from_tiers(*(p for p in (prefix, fallback_prefix) if p))
+        self.prefix = self.endpoint.name
+        logger.info("LLM %s -> %s model=%s configured=%s", prefix, self.prefix, self.model, self.configured)
         path = Path(os.getenv("LLM_CACHE_PATH", "/tmp/ai_trip_llm_cache.sqlite3"))
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
 
-    @staticmethod
-    def _configured(prefix: str) -> bool:
-        return all(os.getenv(f"{prefix}_{k}", "") for k in ("BASE_URL", "API_KEY", "MODEL"))
+    @property
+    def url(self) -> str:
+        return self.endpoint.base_url
+
+    @property
+    def key(self) -> str:
+        return self.endpoint.api_key
+
+    @property
+    def model(self) -> str:
+        return self.endpoint.model
 
     @property
     def configured(self) -> bool:
-        return bool(self.url and self.key and self.model)
+        return self.endpoint.configured
 
     async def json(self, system: str, payload: Any, *, max_tokens: int = 4096, temperature: float = 0.3,
                    cache: bool = True, retries: int = 1, operation: str = "CHAT",
@@ -58,97 +59,21 @@ class CachedModel:
             if row:
                 logger.info("LLM cache hit (%s)", self.prefix)
                 return json.loads(row[0])
-        body = {"model": self.model, "temperature": temperature, "max_tokens": max_tokens,
+        body = {"temperature": temperature, "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         if cache_key and "openai.com" in self.url:
             body["prompt_cache_key"] = cache_key
         logger.info("LLM call %s model=%s system=%d chars payload=%d chars", self.prefix, self.model, len(system), len(user))
-        value = None
         for attempt in range(retries + 1):
-            trace: dict[str, Any] = {}
-            started = time.monotonic()
-            value, retryable = await self._call(body, trace, timeout)
-            await self._report(operation, trace, value is not None, int((time.monotonic() - started) * 1000))
-            if value is not None or not retryable:
+            result = await providers.chat(self.endpoint, body, operation=operation,
+                                          timeout=timeout or LLM_TIMEOUT_SECONDS, parse=providers.json_answer)
+            if result.ok or not result.retryable:
                 break
             logger.warning("LLM attempt %d failed (%s)", attempt + 1, self.prefix)
             await asyncio.sleep(1.5)
+        value = result.value if result.ok else None
         if value is not None and cache:
             self.db.execute("INSERT OR REPLACE INTO cache(key,value) VALUES(?,?)", (key, json.dumps(value, ensure_ascii=False)))
             self.db.commit()
         return value
-
-    async def _report(self, operation: str, trace: dict[str, Any], ok: bool, latency_ms: int) -> None:
-        data = trace.get("response")
-        input_tokens, cached, output_tokens = ai_log.chat_usage(data)
-        await ai_log.report(operation=operation, provider=ai_log.provider_of(self.url), model=self.model, ok=ok,
-                            request=trace.get("request"), response=data, error=trace.get("error"),
-                            input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output_tokens,
-                            latency_ms=latency_ms)
-
-    async def _call(self, body: dict, trace: dict[str, Any] | None = None,
-                    timeout: float | None = None) -> tuple[Any | None, bool]:
-        """(parsed JSON or None, whether an identical retry could succeed).
-
-        `trace` receives the request actually sent, the provider's body and any error, for the
-        AI call log."""
-        trace = trace if trace is not None else {}
-        headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
-        content = ""
-        try:
-            async with httpx.AsyncClient(timeout=timeout or LLM_TIMEOUT_SECONDS) as client:
-                r = await client.post(f"{self.url}/chat/completions", headers=headers, json=body)
-                # Provider quirks: newer OpenAI models reject `max_tokens` (want `max_completion_tokens`)
-                # and non-default `temperature`; some OpenAI-compatible hosts reject `response_format`.
-                for _ in range(3):
-                    if r.status_code != 400:
-                        break
-                    err = r.text.lower()
-                    if "max_tokens" in err and "max_tokens" in body:
-                        max_tokens = body.pop("max_tokens")
-                        body["max_completion_tokens"] = max_tokens
-                    elif "temperature" in err and "temperature" in body:
-                        body = {k: v for k, v in body.items() if k != "temperature"}
-                    elif "response_format" in err and "response_format" in body:
-                        body = {k: v for k, v in body.items() if k != "response_format"}
-                    elif "prompt_cache_key" in err and "prompt_cache_key" in body:
-                        body = {k: v for k, v in body.items() if k != "prompt_cache_key"}
-                    else:
-                        break
-                    r = await client.post(f"{self.url}/chat/completions", headers=headers, json=body)
-                trace["request"] = body
-                if r.status_code != 200:
-                    trace["error"] = {"httpStatus": r.status_code, "body": r.text[:4000]}
-                    logger.error("LLM HTTP %s: %s", r.status_code, r.text[:400])
-                    return None, r.status_code >= 500 or r.status_code == 429
-                data = r.json()
-            trace["response"] = data
-            usage = data.get("usage") or {}
-            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", usage.get("prompt_cache_hit_tokens"))
-            logger.info("LLM usage %s model=%s prompt=%s cached=%s completion=%s", self.prefix, self.model,
-                        usage.get("prompt_tokens"), cached, usage.get("completion_tokens"))
-            choices = data.get("choices") or []
-            if not choices:
-                logger.error("LLM returned no choices: %s", str(data)[:400])
-                return None, True
-            finish = choices[0].get("finish_reason")
-            content = (choices[0].get("message") or {}).get("content") or ""
-            if finish == "length":
-                trace["error"] = {"reason": "output truncated at max_tokens"}
-                # The same request would be cut at the same place: retrying only doubles the bill.
-                logger.error("LLM output truncated at max_tokens=%s",
-                             body.get("max_completion_tokens", body.get("max_tokens")))
-                return None, False
-            if not content.strip():
-                logger.error("LLM returned empty content (finish=%s)", finish)
-                return None, True
-            return json.loads(_FENCE.sub("", content)), False
-        except json.JSONDecodeError as e:
-            trace["error"] = {"reason": "answer is not JSON", "message": str(e)}
-            logger.error("LLM JSON parse error: %s | head=%r", e, content[:300])
-        except Exception as e:  # network, timeout
-            trace.setdefault("request", body)
-            trace["error"] = {"reason": type(e).__name__, "message": str(e)}
-            logger.error("LLM error: %s: %s", type(e).__name__, e)
-        return None, True
