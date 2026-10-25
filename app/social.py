@@ -4,8 +4,9 @@ google-maps-bot downloads the video, cuts frames and audio, verifies candidates 
 applies the evidence guardrail; everything that needs a model is here: the topic pre-filter, the
 place extraction (transcript + frames + caption) and, in `transcription.py`, speech-to-text.
 
-Provider and model come from the job (admin config SOCIAL_LOCATION.AI_PROVIDER / AI_MODEL), resolved
-by `providers.from_provider`. Calls are logged under feature SOCIAL_LOCATION with the Java job id
+Provider and model follow AI_PROVIDER (main model for the extraction, cheap model for the
+pre-filter) unless the job names its own (admin config SOCIAL_LOCATION.AI_PROVIDER / AI_MODEL),
+resolved by `providers.from_provider`. Calls are logged under feature SOCIAL_LOCATION with the Java job id
 as trace id, to the log URL the bot passes along.
 """
 from __future__ import annotations
@@ -38,12 +39,15 @@ _PREFILTER_MAX_TRANSCRIPT_CHARS = 4000
 def bind_log(url: str | None, token: str | None, trace_id: str | None):
     """Send this request's AI call log entries to Java at `url` (the bot derives it from the job's
     callback URL), with the job's internal token."""
-    async def sink(entry: dict) -> None:
+    async def sink(entry: dict) -> Any:
         headers = {"X-Internal-Token": token} if token else {}
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(url, headers=headers, json=entry)
         if response.status_code >= 300:
             logger.warning("AI call log rejected (%s): %s", response.status_code, response.text[:200])
+            return None
+        data = response.json() if response.content else {}
+        return data.get("data") if isinstance(data, dict) else None
 
     return ai_log.bind(sink if url else None, feature="SOCIAL_LOCATION", trace_id=trace_id or None)
 
@@ -107,7 +111,8 @@ async def prefilter(*, metadata: dict[str, Any], transcript: str, ai_provider: s
         return None
 
     try:
-        endpoint = providers.from_provider(ai_provider, ai_model, ai_base_url)
+        # A yes/no triage: the provider's cheap model unless the job names a model.
+        endpoint = providers.from_provider(ai_provider, ai_model, ai_base_url, cheap=True)
     except Exception:
         logger.warning("Topic pre-filter skipped: could not resolve AI credentials", exc_info=True)
         return None

@@ -39,7 +39,7 @@ RESEARCH_CACHE_PATH = os.getenv("AI_TRIP_RESEARCH_CACHE_PATH", "/tmp/ai_trip_res
 LLM_TIMEOUT_SECONDS = _int("AI_TRIP_LLM_TIMEOUT_SECONDS", 180)
 
 # Social video extraction (the media pipeline runs in google-maps-bot, which calls /v1/social/*).
-# Provider keys are the shared .env names, read by `providers.from_provider`.
+# Provider, keys and models come from the AI_PROVIDER switch, read by `providers`.
 AI_REQUEST_TIMEOUT_SECONDS = _int("AI_REQUEST_TIMEOUT_SECONDS", 120)
 # Only sent to OpenAI reasoning-capable models (o-series, gpt-5+). Empty means "low" for the
 # extraction and, for the topic pre-filter, "none" where the model accepts it (gpt-5.1+, gpt-6).

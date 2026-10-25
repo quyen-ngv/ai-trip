@@ -8,13 +8,15 @@ import re
 from datetime import date
 from typing import Any
 from .candidates import activity_category, is_food, meal_hint, pace_plan, row_key
-from .geo import WEEKDAYS, fmt_time, has_coords, haversine_km, travel_estimate
-from .scheduler import MIN_TRANSPORT_KM, REST_KINDS, _rest_row, combined_score
+from .geo import WEEKDAYS, fmt_time, has_coords, haversine_km
+from .scheduler import REST_KINDS, _rest_row, combined_score
 
 logger = logging.getLogger(__name__)
 
 MEAL_WINDOWS = {"BREAKFAST": (5 * 60 + 30, 10 * 60 + 30), "LUNCH": (11 * 60, 14 * 60 + 30), "DINNER": (17 * 60 + 30, 21 * 60 + 30)}
 MEAL_DEFAULT_START = {"BREAKFAST": 7 * 60 + 30, "LUNCH": 12 * 60, "DINNER": 18 * 60 + 30}
+# The trip overview: a few practical lines (season, getting around, what to eat, a tip).
+TRIP_DESCRIPTION_CHARS = 900
 _TIME = re.compile(r"^\s*(\d{1,2})[:h](\d{2})")
 
 
@@ -263,26 +265,6 @@ def _item(stop: _Stop, day: int, locale: str, max_chars: int) -> dict:
     return {key: value for key, value in item.items() if value is not None}
 
 
-def _transport(prev: _Stop, cur: _Stop, day: int, locale: str) -> dict | None:
-    if not (has_coords(prev.row) and has_coords(cur.row)):
-        return None
-    km = haversine_km(prev.row, cur.row)
-    if km < MIN_TRANSPORT_KM:
-        return None
-    mode, mins = travel_estimate(km)
-    start = max(prev.end, cur.start - mins)
-    unit = "phút" if locale.startswith("vi") else "min"
-    title = cur.row["title"][:80]
-    return {
-        "type": "TRANSPORT", "name": (f"Di chuyển đến {title}" if locale.startswith("vi") else f"Travel to {title}"),
-        "dayNumber": day, "sortOrder": 0, "startTime": fmt_time(start), "endTime": fmt_time(max(cur.start, start + 1)),
-        "address": prev.row.get("address"), "latitude": prev.row.get("latitude"), "longitude": prev.row.get("longitude"),
-        "endAddress": cur.row.get("address"), "endLatitude": cur.row.get("latitude"), "endLongitude": cur.row.get("longitude"),
-        "transportMode": mode, "durationValueToNext": mins * 60, "durationToNext": f"{mins} {unit}",
-        "distanceValueToNext": int(km * 1000), "distanceToNext": f"{km:.1f} km",
-    }
-
-
 def materialize(ai: Any, rows: list[dict], day_numbers: list[int], dates: list[date], pace_name: str | None,
                 locale: str, used: set[str], *, max_chars: int = 200, fill_missing_meals: bool = True,
                 first_day_start: int | None = None) -> tuple[list[dict], str, list[str]]:
@@ -346,18 +328,14 @@ def materialize(ai: Any, rows: list[dict], day_numbers: list[int], dates: list[d
         if fill_missing_meals:
             notes += [f"day {n}: {x}" for x in _ensure_meals(stops, food_pool, used, pace, weekday, locale)]
             notes += [f"day {n}: {x}" for x in _fix_overlaps(stops, pace)]
-        prev: _Stop | None = None
+        # No "Travel to …" rows inside a destination: the app draws every leg between two stops
+        # itself (distance and time from the map), so a row per hop only doubled the list.
         for s in stops:
-            if prev is not None:
-                t = _transport(prev, s, n, locale)
-                if t:
-                    items.append(t)
             items.append(_item(s, n, locale, max_chars))
-            prev = s
         if not stops:
             notes.append(f"day {n}: AI returned no stops")
     desc = str(ai.get("tripDescription") or "").strip()
-    return items, desc[:400], notes
+    return items, desc[:TRIP_DESCRIPTION_CHARS], notes
 
 
 def append_missing_social_items(

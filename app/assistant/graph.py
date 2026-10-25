@@ -7,6 +7,11 @@ limit. Whatever happens, Java hears back exactly once: a reply, or a failure.
 A round that neither calls a tool nor returns the final JSON is usually the model announcing
 work ("Mình xem thời tiết nhé") and stopping. That text is never posted as the answer: the model
 is sent back once to either call the tool or answer properly.
+
+2026-10-25 (prod call-log audit): tool calls are bounded per tool and per answer, an exact repeat
+of an earlier call is answered with a note instead of running again, an unknown tool name costs
+nothing, and `get_place_details` / `travel_time` take a list so one model round fetches what
+used to take six (the model asked for one place or one hop per round).
 """
 from __future__ import annotations
 
@@ -15,25 +20,32 @@ import json
 import logging
 import re
 import unicodedata
+from collections import Counter
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .. import ai_log
-from . import web_search
+from . import read_url, web_search
 from .chat_model import ChatModel
 from .gateway import JavaGateway, TurnClosed
-from .prompts import SYSTEM, context_message, history_messages
+from .prompts import SYSTEM, history_messages, question_message
 from .tools import collect_names, step_for, tools_for
 
 logger = logging.getLogger(__name__)
 
+# Used only when Java does not send limits.timeoutSeconds (an older backend).
 TURN_TIMEOUT_SECONDS = 120
 MAX_TOOL_RESULT_CHARS = 6000
 # The whole destination catalogue with its guide text is read in one go; cutting it would hide
 # destinations from the model.
-TOOL_RESULT_CHARS = {"explore_destinations": 40000}
+TOOL_RESULT_CHARS = {"explore_destinations": 40000, "read_url": 7000}
 MAX_WEB_SEARCHES = 1
+# Pages read per answer: a list article found by the search, or a link the user sent.
+MAX_PAGE_READS = 2
+BUDGET_USED = "Tool budget used up: write the final JSON answer now with what you have."
+# Rounds the model may still ask for tools after the budget is spent before the turn ends anyway.
+MAX_OVER_BUDGET_ROUNDS = 2
 MAX_ACTIONS = 3
 MAX_CARDS = 6
 MAX_DESTINATIONS = 4
@@ -41,6 +53,18 @@ MAX_DESTINATIONS = 4
 CARD_POOLS = {"TRIP": ("public_trip", "trip"), "EVENT": ("event",), "MEETUP": ("meetup",),
               "CHECKIN": ("checkin",), "FOOD": ("dish",)}
 MAX_MEMORY_CHARS = 1500
+# Uses of one tool in one answer (items for the batch tools). Past the limit the call is refused
+# with a short note and does not count toward the budget: the log showed get_weather asked for a
+# price question and get_place_community for nine search rows one after another.
+TOOL_LIMITS = {"get_weather": 1, "get_place_community": 2, "get_place_details": 8, "travel_time": 12,
+               "search_places": 4, "explore_destinations": 1, "get_destination_guide": 2, "get_local_dishes": 1,
+               "search_events": 2, "search_meetups": 1, "search_public_trips": 2, "get_budget": 1,
+               "get_trip_checkins": 1, "rank_trip_places": 1, "list_my_trips": 1, "get_trip": 2}
+TOOL_LIMIT_DEFAULT = 3
+# Batch tools: (list argument, per-item argument built from it, cap). One model round, the Java
+# calls run at once, one tool call against the budget.
+BATCHES = {"get_place_details": ("place_ids", "place_id", 6), "travel_time": ("legs", None, 10)}
+REPEATED_CALL = "Same call already answered above in this conversation: use that result."
 NUDGE = ("Your last message was neither a tool call nor the final JSON, so the user would see nothing useful. "
          "If you meant to check something, call that tool now. Otherwise reply with the final JSON answer.")
 # A short plain-text round, or one that says what Pengoo is about to do, is an announcement and
@@ -66,9 +90,15 @@ class State(TypedDict, total=False):
     messages: list[dict]
     tool_calls: int
     web_searches: int
+    pages_read: int
+    budget_told: bool
+    over_budget_rounds: int
     nudged: bool
+    thin: bool
+    web_pushed: bool
     final: dict
     usage: dict
+    stop_reason: str
 
 
 # Any of these makes a JSON object the reply's final format rather than data quoted in prose.
@@ -317,6 +347,64 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
     return reply
 
 
+# Fewer rows than this that really match the ask, and the catalogue is thin for it.
+THIN_CATALOGUE_ROWS = 3
+# "Near a stop of the trip" means walking distance or a very short ride.
+NEAR_STOP_KM = 1.5
+# PlaceSubType.Family.FOOD in Java; every other type is a sight (markets, beaches, viewpoints…).
+FOOD_TYPES = {"RESTAURANT", "STREET_FOOD", "CAFE", "TEA", "BAR", "BAKERY", "DESSERT", "SEAFOOD", "VEGETARIAN",
+              "VEGAN", "HALAL"}
+THIN_CATALOGUE_NOTE = ("The app's map has little for this ask (it is not a full map of Vietnam): {reasons}. Call "
+                       "web_search now for what the user asked (the kind, dish or fact plus the area and the city, "
+                       "in the user's language), then answer with the best of both: rows here that truly fit as "
+                       "place cards, web finds named in the text with their source link. Leave out rows that do "
+                       "not fit; do not list them as a fallback.")
+WEB_PUSH = ("Your search came back thin for this ask and web_search is still unused. Do not answer with places that "
+            "do not fit or with 'ask the locals': call web_search now for exactly what the user asked, then write "
+            "the final JSON with what fits.")
+
+
+def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -> Any:
+    """Marks a search_places result the catalogue cannot really answer, so the model searches the web
+    instead of stretching weak rows or naming venues from memory.
+
+    Thin when any of these holds: the radius had to be widened; fewer than three rows match the
+    asked name words (the tool pads a short list with same-kind places whose names do not contain
+    them); fewer than three rows at all; an asked type has no row (asked SEAFOOD and MARKET, got
+    only seafood restaurants: the market part is unanswered); the search was around a stop of the
+    trip and fewer than three rows are within walking distance of it. Only while a web search is
+    still available; otherwise the result is left as it came."""
+    if not web_left or not isinstance(result, dict) or not isinstance(result.get("places"), list):
+        return result
+    rows = [row for row in result["places"] if isinstance(row, dict)]
+    searched = result.get("searched") or {}
+    words = _fold(str(searched.get("nameWords") or "")).split()
+    reasons: list[str] = []
+    if any("radius" in str(step) for step in result.get("relaxed") or []):
+        reasons.append("the search had to be widened")
+    matching = [row for row in rows if row.get("nameMatch") is not False
+                and set(words) <= set(_fold(str(row.get("name") or "")).split())]
+    if len(matching) < THIN_CATALOGUE_ROWS:
+        reasons.append(f"only {len(matching)} place(s) match '{searched.get('nameWords')}'" if words
+                       else f"only {len(matching)} place(s) found")
+    # Sibling types are often asked together as alternatives (CAFE or TEA); a type of the other
+    # family (a MARKET next to SEAFOOD) is a second thing the user asked for.
+    found_types = {str(t) for row in rows for t in row.get("types") or []}
+    found_families = {t in FOOD_TYPES for t in found_types}
+    missing = [str(t) for t in searched.get("types") or []
+               if str(t) not in found_types and (str(t) in FOOD_TYPES) not in found_families]
+    if missing:
+        reasons.append("nothing of type " + ", ".join(missing))
+    if (args or {}).get("activity_id"):
+        close = [row for row in rows if isinstance(row.get("distanceKm"), (int, float))
+                 and row["distanceKm"] <= NEAR_STOP_KM]
+        if len(close) < THIN_CATALOGUE_ROWS:
+            reasons.append(f"only {len(close)} place(s) within {NEAR_STOP_KM} km of {result.get('near') or 'that stop'}")
+    if not reasons:
+        return result
+    return {**result, "coverage": "thin", "note": THIN_CATALOGUE_NOTE.format(reasons="; ".join(reasons))}
+
+
 def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     limits = turn.get("limits") or {}
     max_tool_calls = int(limits.get("maxToolCalls") or 6)
@@ -352,11 +440,20 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     known_places = set(allowed_places)
 
     async def agent(state: State) -> State:
+        if ai_log.credit_exhausted():
+            # The asker ran out of AI credits on the last call: no further model call. Java posts
+            # what was written so far with a "credits ran out" notice.
+            return {"final": partial_answer(state["messages"]), "stop_reason": ai_log.CREDIT_EXHAUSTED}
         budget_left = max_tool_calls - state.get("tool_calls", 0)
-        messages = list(state["messages"])
-        if budget_left <= 0:
-            messages.append({"role": "system", "content": "Tool budget used up: write the final JSON answer now."})
-        reply = await model.complete(messages, tools if budget_left > 0 else None, max_tokens=max_output,
+        history = list(state["messages"])
+        if budget_left <= 0 and not state.get("budget_told"):
+            # Kept in the history, not added for one request and dropped: Claude binds each thinking
+            # block to the exact conversation and tool list it came from, so a message that comes
+            # and goes, or a tool list that shrinks to nothing, gets the next request refused (400
+            # "the block is bound to a different conversation"). The tools stay offered; run_tools
+            # answers any call past the budget with an error instead of running it.
+            history.append({"role": "system", "content": BUDGET_USED})
+        reply = await model.complete(history, tools, max_tokens=max_output,
                                      operation="ASSISTANT_TURN", cache_key=cache_key)
         if reply is None:
             raise RuntimeError("model call failed")
@@ -369,19 +466,30 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         if reply.get("_anthropic_content"):
             # Claude's blocks go back verbatim next round: its thinking must return with tool results.
             message["_anthropic_content"] = reply["_anthropic_content"]
-        if calls:
+        told = {"budget_told": True} if budget_left <= 0 else {}
+        if calls and state.get("over_budget_rounds", 0) < MAX_OVER_BUDGET_ROUNDS:
             message["tool_calls"] = calls
             if content and not content.startswith("{"):
                 await java.step("thought", {}, content[:300])
-            return {"messages": state["messages"] + [message], "usage": usage}
+            over = state.get("over_budget_rounds", 0) + (1 if budget_left <= 0 else 0)
+            return {"messages": history + [message], "usage": usage, "over_budget_rounds": over, **told}
+        # Still calling tools after being told twice the budget is spent: stop here and answer with
+        # what this reply and the earlier ones hold.
         final = parse_json(content)
         acted = state.get("tool_calls", 0) > 0
         if final is None and budget_left > 0 and not state.get("nudged") and looks_like_announcement(content, acted):
             # Announced work without doing it: one more round to act.
             if content:
                 await java.step("thought", {}, content[:300])
-            return {"messages": state["messages"] + [message, {"role": "system", "content": NUDGE}],
-                    "usage": usage, "nudged": True}
+            return {"messages": history + [message, {"role": "system", "content": NUDGE}],
+                    "usage": usage, "nudged": True, **told}
+        if (state.get("thin") and web_allowed and not state.get("web_searches") and not state.get("web_pushed")
+                and budget_left > 0):
+            # Prod 2026-10-25: asked about a morning market on the beach, the model got three seafood
+            # restaurants 3-4 km away, ignored the thin flag, listed them and told the user to ask
+            # the locals. One more round to search for what was actually asked.
+            return {"messages": history + [message, {"role": "system", "content": WEB_PUSH}],
+                    "usage": usage, "web_pushed": True, **told}
         final = final or parse_final(content)
         if not str(final.get("answer") or "").strip():
             # An empty JSON answer after a plain-text round: that text was the answer.
@@ -389,13 +497,30 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                        if m.get("role") == "assistant" and m.get("content") and not m.get("tool_calls")]
             if earlier:
                 final["answer"] = _FENCE.sub("", earlier[-1]).strip()
-        return {"messages": state["messages"] + [message], "usage": usage, "final": final}
+        return {"messages": history + [message], "usage": usage, "final": final, **told}
+
+    tool_names = {t["function"]["name"] for t in tools}
+    # Results of this turn's Java calls by (tool, arguments): a repeated call is answered from here
+    # without another request, and a batch reuses the items it already has.
+    answered: dict[str, Any] = {}
+    uses: Counter[str] = Counter()
+
+    async def java_once(name: str, args: dict) -> Any:
+        key = call_key(name, args)
+        if key not in answered:
+            result = await java.tool(name, args)
+            collect_names(result, names, ids)
+            answered[key] = result
+        return answered[key]
 
     async def run_tools(state: State) -> State:
         last = state["messages"][-1]
         results: list[dict] = []
         used = state.get("tool_calls", 0)
         searched = state.get("web_searches", 0)
+        pages = state.get("pages_read", 0)
+        thin = bool(state.get("thin"))
+        seen_this_round: set[str] = set()
         for call in last.get("tool_calls") or []:
             function = call.get("function") or {}
             name = function.get("name") or ""
@@ -405,27 +530,73 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                 args = {}
             if not isinstance(args, dict):
                 args = {}
-            key, params = step_for(name, args, names)
-            await java.step(key, params)
+
+            def answer(payload: Any, call=call, name=name) -> None:
+                results.append({"role": "tool", "tool_call_id": call.get("id"),
+                                "content": json.dumps(payload, ensure_ascii=False, default=str)
+                                [:TOOL_RESULT_CHARS.get(name, MAX_TOOL_RESULT_CHARS)]})
+
+            if name not in tool_names:
+                answer({"error": f"Unknown tool '{name}'. Use only the tools offered, or answer with what you have."})
+                continue
+            items = batch_items(name, args)
+            if not items:
+                answer({"error": "Missing arguments: give place_ids / legs (or place_id / from and to)."})
+                continue
+            key = call_key(name, args)
+            if key in answered or key in seen_this_round:
+                answer({"note": REPEATED_CALL})
+                continue
+            if used >= max_tool_calls:
+                answer({"error": BUDGET_USED})
+                continue
+            limit = TOOL_LIMITS.get(name, TOOL_LIMIT_DEFAULT)
+            if uses[name] + len(items) > limit:
+                answer({"error": f"{name} was already used {uses[name]} time(s) in this answer (limit {limit}): "
+                                 "answer with what you have."})
+                continue
+            seen_this_round.add(key)
+            step_key, params = step_for(name, args, names)
+            await java.step(step_key, params)
             if name == "web_search":
                 if not web_allowed or searched >= MAX_WEB_SEARCHES:
-                    result: dict = {"error": "Web search is not available for this answer; answer from what you have."}
+                    result: Any = {"error": "Web search is not available for this answer; answer from what you have."}
                 else:
                     searched += 1
                     result = await web_search.search(str(args.get("query") or ""))
+            elif name == "read_url":
+                if not web_allowed or pages >= MAX_PAGE_READS:
+                    result = {"error": "No more pages can be read for this answer; answer from what you have."}
+                else:
+                    pages += 1
+                    result = await read_url.read(str(args.get("url") or ""))
+            elif name in BATCHES and BATCHES[name][0] in args:
+                rows = await asyncio.gather(*(java_once(name, item) for item in items))
+                if name == "travel_time":
+                    result = {"legs": [{**item, **(row if isinstance(row, dict) else {"result": row})}
+                                       for item, row in zip(items, rows)]}
+                else:
+                    result = {"places": list(rows)}
             else:
-                result = await java.tool(name, args)
-                collect_names(result, names, ids)
+                result = await java_once(name, items[0])
+                if name == "search_places":
+                    result = flag_thin_catalogue(result, web_allowed and searched < MAX_WEB_SEARCHES, args)
+                    thin = thin or (isinstance(result, dict) and result.get("coverage") == "thin")
+            uses[name] += len(items)
             used += 1
-            results.append({"role": "tool", "tool_call_id": call.get("id"),
-                            "content": json.dumps(result, ensure_ascii=False, default=str)[:TOOL_RESULT_CHARS.get(name, MAX_TOOL_RESULT_CHARS)]})
-        return {"messages": state["messages"] + results, "tool_calls": used, "web_searches": searched}
+            answered.setdefault(key, result)
+            answer(result)
+        return {"messages": state["messages"] + results, "tool_calls": used, "web_searches": searched,
+                "pages_read": pages, "thin": thin}
 
     async def finish(state: State) -> State:
         await java.step("writing_answer", {})
         found = {pid: names[pid] for pid in allowed_places - known_places if pid in names}
         final = attach_mentioned_places(state.get("final") or {}, found)
-        await java.reply(clean_reply(final, allowed_places, state.get("usage") or {}, ids))
+        reply = clean_reply(final, allowed_places, state.get("usage") or {}, ids)
+        if state.get("stop_reason"):
+            reply["stopReason"] = state["stop_reason"]
+        await java.reply(reply)
         return {}
 
     def route(state: State) -> str:
@@ -444,12 +615,42 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     return graph.compile()
 
 
+def partial_answer(messages: list[dict]) -> dict:
+    """The answer when the turn stops for credit: the latest prose Pengoo wrote (a JSON reply or a
+    bare tool round adds nothing readable), or an empty answer for Java's fixed notice."""
+    for message in reversed(messages):
+        content = (message.get("content") or "").strip() if message.get("role") == "assistant" else ""
+        if content and not content.startswith("{"):
+            return {"answer": _FENCE.sub("", content).strip()}
+    return {"answer": ""}
+
+
+def call_key(name: str, args: dict) -> str:
+    return name + json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def batch_items(name: str, args: dict) -> list[dict]:
+    """The per-call argument sets one tool call stands for: several for a batch tool given its list
+    argument, one otherwise. Empty when a batch tool got neither form."""
+    if name not in BATCHES:
+        return [args]
+    list_key, item_key, cap = BATCHES[name]
+    if name == "travel_time":
+        legs = [leg for leg in args.get(list_key) or [] if isinstance(leg, dict) and leg.get("from") and leg.get("to")]
+        if legs:
+            return [{"from": str(leg["from"]), "to": str(leg["to"])} for leg in legs[:cap]]
+        return [{"from": str(args["from"]), "to": str(args["to"])}] if args.get("from") and args.get("to") else []
+    ids = [str(v) for v in args.get(list_key) or [] if v]
+    if not ids and args.get(item_key):
+        ids = [str(args[item_key])]
+    return [{item_key: value} for value in dict.fromkeys(ids[:cap])]
+
+
 def initial_messages(turn: dict) -> list[dict]:
-    question = str(turn.get("question") or "").strip()
-    user = (turn.get("user") or {}).get("name") or ""
-    return ([{"role": "system", "content": SYSTEM}, {"role": "system", "content": context_message(turn)}]
-            + history_messages(turn)
-            + [{"role": "user", "content": f"{user}: {question}" if user else question}])
+    """The static rules, the chat so far, then one user message with the per-turn context and the
+    question: everything before the last message is a stable prefix for the provider cache."""
+    return ([{"role": "system", "content": SYSTEM}] + history_messages(turn)
+            + [{"role": "user", "content": question_message(turn)}])
 
 
 async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> None:
@@ -457,10 +658,10 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
     java = JavaGateway(turn["callbackBaseUrl"], turn["turnId"], token)
     log_payloads = bool(turn.get("logPayloads", True))
 
-    async def sink(entry: dict) -> None:
+    async def sink(entry: dict) -> Any:
         if not log_payloads:
             entry = {**entry, "request": None, "response": None, "error": None}
-        await java.ai_call(entry)
+        return await java.ai_call(entry)
 
     binding = ai_log.bind(sink, feature="ASSISTANT")
     try:
@@ -470,10 +671,15 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
         if turn.get("trip"):
             await java.step("reading_trip", {})
         graph = build_graph(turn, java, chosen)
-        # Each agent round plus its tool round is two graph steps, plus one nudge round, start and finish.
-        limit = 2 * (int((turn.get("limits") or {}).get("maxToolCalls") or 6) + 2) + 6
+        limits = turn.get("limits") or {}
+        # Each agent round plus its tool round is two graph steps; on top of the budget, the rounds
+        # refused past it, one nudge round, start and finish.
+        limit = 2 * (int(limits.get("maxToolCalls") or 6) + 2 + MAX_OVER_BUDGET_ROUNDS) + 6
+        # Java sends how long it waits before failing the turn itself, minus a margin (a PRO budget
+        # of 20 tool calls needs far longer than the old fixed 120 s).
+        timeout = int(limits.get("timeoutSeconds") or TURN_TIMEOUT_SECONDS)
         await asyncio.wait_for(graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0},
-                                             {"recursion_limit": limit}), timeout=TURN_TIMEOUT_SECONDS)
+                                             {"recursion_limit": limit}), timeout=timeout)
     except TurnClosed:
         logger.info("assistant turn %s closed by Java before the answer", turn.get("turnId"))
     except Exception as exc:

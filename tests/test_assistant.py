@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from app import ai_log
 from app.assistant import graph as graph_module
 from app.assistant.graph import build_graph, clean_cards, clean_destinations, clean_reply, initial_messages, parse_final, run_turn
 from app.assistant.prompts import history_messages
@@ -104,13 +105,69 @@ async def test_agent_calls_a_tool_shows_steps_and_replies_with_only_real_places(
 @pytest.mark.asyncio
 async def test_tool_budget_forces_an_answer():
     java = FakeJava()
-    looping = {"content": "", "tool_calls": [tool_call("search_places", {"query": "x"})]}
-    model = ScriptedModel(looping, looping, {"content": '{"answer": "Xong"}'})
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_places", {"query": "x"})]},
+                          {"content": "", "tool_calls": [tool_call("search_places", {"query": "y"})]},
+                          {"content": '{"answer": "Xong"}'})
     graph = build_graph(TURN, java, model)
     await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
     assert len(java.tools) == 2
-    assert model.calls[2]["tools"] is None
+    # The same tool list every round: Claude refuses a thinking block whose tool list changed.
+    assert model.calls[2]["tools"] == model.calls[0]["tools"]
+    told = [m for m in model.calls[2]["messages"] if m.get("content") == graph_module.BUDGET_USED]
+    assert len(told) == 1
     assert java.replies[0]["markdown"] == "Xong"
+
+
+@pytest.mark.asyncio
+async def test_calls_past_the_budget_are_refused_and_the_turn_still_ends():
+    java = FakeJava()
+    rounds = [{"content": "", "tool_calls": [tool_call("search_places", {"query": f"x{i}"})]} for i in range(4)]
+    last = {"content": '{"answer": "Xong"}', "tool_calls": [tool_call("search_places", {"query": "y"})]}
+    model = ScriptedModel(*rounds, last)
+    graph = build_graph(TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert len(java.tools) == 2                       # nothing ran past the budget of 2
+    assert len(model.calls) == 5
+    # The budget notice was added once and stayed in place: the history only ever grows.
+    for earlier, later in zip(model.calls, model.calls[1:]):
+        assert later["messages"][:len(earlier["messages"])] == earlier["messages"]
+    assert java.replies[0]["markdown"] == "Xong"
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_call_is_answered_without_running_and_a_batch_is_one_tool_call():
+    java = FakeJava()
+    turn = {**TURN, "limits": {"maxToolCalls": 3, "maxOutputTokens": 800}}
+    model = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("search_places", {"query": "bún chả"}, "c1"),
+                                       tool_call("search_places", {"query": "bún chả"}, "c2"),
+                                       tool_call("noop", {}, "c3")]},
+        {"content": "", "tool_calls": [tool_call("get_place_details", {"place_ids": [PLACE, "p2", PLACE]}, "c4"),
+                                       tool_call("travel_time", {"legs": [{"from": "a", "to": "b"}, {"from": "b", "to": "c"}]}, "c5")]},
+        {"content": '{"answer": "Xong"}'})
+    graph = build_graph(turn, java, model)
+    await graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0})
+    assert java.tools == [("search_places", {"query": "bún chả"}),
+                          ("get_place_details", {"place_id": PLACE}), ("get_place_details", {"place_id": "p2"}),
+                          ("travel_time", {"from": "a", "to": "b"}), ("travel_time", {"from": "b", "to": "c"})]
+    first_round = [json.loads(m["content"]) for m in model.calls[1]["messages"] if m.get("role") == "tool"]
+    assert first_round[1] == {"note": graph_module.REPEATED_CALL}
+    assert "Unknown tool" in first_round[2]["error"]
+    second_round = [json.loads(m["content"]) for m in model.calls[2]["messages"] if m.get("role") == "tool"][3:]
+    assert len(second_round[0]["places"]) == 2 and [leg["from"] for leg in second_round[1]["legs"]] == ["a", "b"]
+    assert java.replies[0]["markdown"] == "Xong"     # three real calls fitted the budget of 3
+
+
+@pytest.mark.asyncio
+async def test_a_tool_past_its_own_limit_is_refused_without_spending_the_budget():
+    java = FakeJava()
+    weather = [{"content": "", "tool_calls": [tool_call("get_weather", {"city": c}, c)]} for c in ("Huế", "Hội An")]
+    model = ScriptedModel(*weather, {"content": '{"answer": "Xong"}'})
+    graph = build_graph({**TURN, "limits": {"maxToolCalls": 5}}, java, model)
+    await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    assert [name for name, _ in java.tools] == ["get_weather"]
+    refused = json.loads([m for m in model.calls[2]["messages"] if m.get("role") == "tool"][-1]["content"])
+    assert "limit 1" in refused["error"]
 
 
 @pytest.mark.asyncio
@@ -172,13 +229,42 @@ def test_budget_tool_needs_a_trip_only_in_the_direct_chat():
     assert len(direct_budget) == 1 and direct_budget[0]["function"]["parameters"]["required"] == ["trip_id"]
 
 
-def test_messages_put_static_rules_first_and_name_people():
+def test_messages_put_static_rules_first_history_next_and_context_with_the_question_last():
     messages = initial_messages(TURN)
     assert messages[0]["role"] == "system" and "Pengoo" in messages[0]["content"]
-    assert "Vietnamese" in messages[1]["content"] and ACTIVITY in messages[1]["content"]
-    assert messages[2] == {"role": "user", "content": "Bình: Mai đi đâu?"}
-    assert messages[3] == {"role": "assistant", "content": "Đi biển nhé"}
-    assert messages[-1]["content"] == "An: tối ngày 2 ăn gì gần khách sạn?"
+    assert messages[1] == {"role": "user", "content": "Bình: Mai đi đâu?"}
+    assert messages[2] == {"role": "assistant", "content": "Đi biển nhé"}
+    last = messages[-1]
+    assert last["role"] == "user" and len(messages) == 4
+    # Per-turn context travels after the history so the history stays a cacheable prefix.
+    assert last["content"].startswith("<context>\n") and "Reply in: Vietnamese." in last["content"]
+    assert ACTIVITY in last["content"] and "lat" not in last["content"]
+    assert last["content"].endswith("</context>\n\nAn: tối ngày 2 ăn gì gần khách sạn?")
+
+
+def test_reply_language_follows_the_question_then_the_app():
+    from app.assistant.prompts import reply_language
+    assert reply_language("What should we eat today?", "vi") == "English"
+    assert reply_language("Hà nội có quán phở nào kiểu local ko", "en") == "Vietnamese"
+    assert reply_language("tim quan pho ngon o ha noi", "en") == "Vietnamese"
+    assert reply_language("Hội An?", "en") == "English"          # a place name, not a Vietnamese question
+    assert reply_language("오늘 뭐 먹지?", "vi") == "Korean"
+    assert reply_language("Ok", "ja") == "Japanese"
+
+
+def test_trip_snapshot_is_compacted_with_ride_minutes():
+    from app.assistant.prompts import compact_trip
+    trip = {"startDate": [2026, 12, 19], "today": {"date": [2026, 10, 24], "startsInDays": 56},
+            "days": [{"day": 1, "date": [2026, 12, 19], "activities": [
+                {"id": "a", "name": "Thác", "lat": 20.8129, "lng": 104.5916, "placeId": "p1"},
+                {"id": "b", "name": "Cafe", "lat": 20.8206, "lng": 104.5995,
+                 "note": "Gợi ý từ nguồn Web đã trích dẫn, chưa có trong dữ liệu của chúng tôi. Sources: h…"}]}]}
+    out = compact_trip(trip)
+    assert out["startDate"] == "2026-12-19" and out["today"]["date"] == "2026-10-24"
+    first, second = out["days"][0]["activities"]
+    assert out["days"][0]["date"] == "2026-12-19"
+    assert "lat" not in first and first["rideMinToNext"] == 11
+    assert second == {"id": "b", "name": "Cafe", "fromWeb": True}
 
 
 def test_direct_chat_gets_trip_tools_and_names_resolve():
@@ -365,14 +451,14 @@ def test_earlier_cards_are_named_in_history_and_may_be_cards_again():
     turn = {**TURN, "history": [{"role": "assistant", "text": "Hai quán nè",
                                  "places": [{"id": PLACE, "name": "Cộng Cà Phê"}]}]}
     messages = initial_messages(turn)
-    assert "Cộng Cà Phê (" + PLACE + ")" in messages[2]["content"]
+    assert "Cộng Cà Phê (" + PLACE + ")" in messages[1]["content"]
     reply = clean_reply({"answer": "x", "places": [{"placeId": PLACE}]}, {PLACE}, {})
     assert reply["places"] == [{"placeId": PLACE, "note": None}]
 
 
 def test_memory_is_in_the_context():
     messages = initial_messages({**TURN, "memory": "Khởi hành từ Đà Nẵng."})
-    assert "Khởi hành từ Đà Nẵng." in messages[1]["content"]
+    assert "Khởi hành từ Đà Nẵng." in messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -563,3 +649,122 @@ def test_prose_followed_by_json_keeps_the_prose_as_the_answer():
     assert final["suggestions"] == ["Gợi ý lịch trình Huế 2 ngày"]
     fenced = parse_final('Huế nhé!\n```json\n{"suggestions": ["Ăn gì?"]}\n```')
     assert fenced == {"suggestions": ["Ăn gì?"], "answer": "Huế nhé!"}
+
+
+def test_thin_catalogue_results_point_to_the_web():
+    def result(names, words=None, relaxed=None):
+        out = {"searched": {"nameWords": words} if words else {}, "places": [{"id": n, "name": n} for n in names]}
+        if relaxed:
+            out["relaxed"] = relaxed
+        return out
+
+    # The asked words match only one row: the rest are same-kind padding.
+    padded = result(["Phở Chay Hà Nội", "Chayfood", "Bonbagu Vegan"], "phở chay", ["added places of the same kind"])
+    assert graph_module.flag_thin_catalogue(padded, True)["coverage"] == "thin"
+    # A widened radius is thin however many rows came back.
+    far = result(["A", "B", "C"], relaxed=["widened the radius to 30 km"])
+    assert graph_module.flag_thin_catalogue(far, True)["coverage"] == "thin"
+    assert graph_module.flag_thin_catalogue(result(["A"]), True)["coverage"] == "thin"
+    # Enough real matches, or no web search left: left as it came.
+    full = result(["Phở Thìn", "Phở Bát Đàn", "Phở 10 Lý Quốc Sư"], "phở")
+    assert "coverage" not in graph_module.flag_thin_catalogue(full, True)
+    assert "coverage" not in graph_module.flag_thin_catalogue(result(["A"]), False)
+
+
+def test_restaurants_far_from_the_stop_do_not_answer_a_beach_market_question():
+    # Prod 2026-10-25: "chợ buổi sáng ở bãi biển… có gì ăn" near a café on day 1.
+    rows = [{"id": n, "name": n, "types": ["RESTAURANT", "SEAFOOD"], "distanceKm": d}
+            for n, d in (("Garden House", 3.7), ("Quán Nhậu 6 Vân", 3.7), ("Nhà Bè Bảo An", 2.9))]
+    result = {"near": "Tiệm Cà Phê Nhà Ven Biển", "searched": {"types": ["SEAFOOD", "STREET_FOOD", "MARKET"]},
+              "places": rows}
+    flagged = graph_module.flag_thin_catalogue(result, True, {"activity_id": "a1"})
+    assert flagged["coverage"] == "thin"
+    assert "nothing of type MARKET" in flagged["note"] and "STREET_FOOD" not in flagged["note"]
+    assert "within 1.5 km" in flagged["note"]
+    # Sibling food types asked as alternatives are not a missing part.
+    cafes = {"searched": {"types": ["CAFE", "TEA"]},
+             "places": [{"id": n, "name": n, "types": ["CAFE"]} for n in "ABC"]}
+    assert "coverage" not in graph_module.flag_thin_catalogue(cafes, True)
+
+
+@pytest.mark.asyncio
+async def test_an_answer_over_a_thin_search_is_sent_back_once_to_search_the_web(monkeypatch):
+    from app.assistant import web_search
+
+    async def fake_search(query):
+        return {"results": [{"title": "Chợ cá Dốc Lết", "url": "https://x.vn/a", "snippet": "Chợ cá 5h sáng"}]}
+
+    monkeypatch.setattr(web_search, "configured", lambda: True)
+    monkeypatch.setattr(web_search, "search", fake_search)
+    java = FakeJava()   # one row only: thin
+    turn = {**TURN, "limits": {"maxToolCalls": 4, "webSearch": True}}
+    weak = '{"answer": "Mình chưa có thông tin, bạn hỏi người dân nhé."}'
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_places", {"types": ["MARKET"]})]},
+                          {"content": weak},
+                          {"content": "", "tool_calls": [tool_call("web_search", {"query": "chợ cá Dốc Lết"}, "w1")]},
+                          {"content": '{"answer": "Có, **chợ cá** họp lúc 5h sáng."}'})
+    graph = build_graph(turn, java, model)
+    await graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0})
+    pushes = [m for m in model.calls[2]["messages"] if m.get("content") == graph_module.WEB_PUSH]
+    assert len(pushes) == 1 and len(model.calls) == 4
+    assert java.replies[0]["markdown"] == "Có, **chợ cá** họp lúc 5h sáng."
+
+
+def test_read_url_keeps_the_shop_names_of_a_list_article():
+    from app.assistant.read_url import html_to_text
+    title, text = html_to_text(
+        "<html><head><title>Top 3 quán bánh tráng cuốn</title><script>var x=1</script></head><body>"
+        "<nav>Trang chủ</nav><h2>1. Bánh tráng cuốn Hoàng Bèo</h2><p>Số 9 ngõ 3 Quang Trung</p>"
+        "<ul><li>Giá: 50k</li></ul><footer>© báo</footer></body></html>")
+    assert title == "Top 3 quán bánh tráng cuốn"
+    assert "## 1. Bánh tráng cuốn Hoàng Bèo" in text and "Số 9 ngõ 3 Quang Trung" in text and "- Giá: 50k" in text
+    assert "var x" not in text and "Trang chủ" not in text and "© báo" not in text
+
+
+@pytest.mark.asyncio
+async def test_read_url_refuses_private_addresses_and_odd_links():
+    from app.assistant import read_url
+    assert "error" in await read_url.read("http://127.0.0.1:8080/admin")
+    assert "error" in await read_url.read("http://10.0.0.5/")
+    assert "error" in await read_url.read("file:///etc/passwd")
+    assert "error" in await read_url.read("not a link")
+
+
+def test_reading_pages_comes_with_web_search():
+    names = {t["function"]["name"] for t in tools_for("TRIP", web_search=True)}
+    assert {"web_search", "read_url"} <= names
+    assert "read_url" not in {t["function"]["name"] for t in tools_for("TRIP")}
+    assert step_for("read_url", {"url": "https://www.toplist.vn/top-11"}, {}) == ("read_page", {"name": "toplist.vn"})
+
+
+class ReportingModel(ScriptedModel):
+    """Logs each call like the real chat model, so Java's credit answer reaches the turn."""
+
+    async def complete(self, messages, tools=None, **kwargs):
+        reply = await super().complete(messages, tools, **kwargs)
+        await ai_log.report(operation="ASSISTANT_TURN", provider="p", model="m", ok=True, request={})
+        return reply
+
+
+@pytest.mark.asyncio
+async def test_running_out_of_credit_stops_with_what_was_written():
+    java = FakeJava()
+
+    async def sink(entry):
+        return {"creditBalance": -12, "creditExhausted": True}
+
+    binding = ai_log.bind(sink, feature="ASSISTANT")
+    try:
+        model = ReportingModel(
+            {"content": "Mình đang tìm quán bún chả cá gần khách sạn.",
+             "tool_calls": [tool_call("search_places", {"query": "bún chả cá"})]},
+            {"content": FINAL})
+        graph = build_graph(TURN, java, model)
+        await graph.ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+    finally:
+        ai_log.unbind(binding)
+
+    assert len(model.calls) == 1                     # no model call after the credit ran out
+    reply = java.replies[0]
+    assert reply["stopReason"] == "CREDIT_EXHAUSTED"
+    assert reply["markdown"] == "Mình đang tìm quán bún chả cá gần khách sạn."

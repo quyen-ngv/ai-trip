@@ -8,6 +8,12 @@ Rules live in the `config` table (label AI_TRIP) so product can tune them withou
 the DEFAULT_* constants below are the fallback AND the seed for that table
 (see goroute migrations V148__ai_trip_prompt_config.sql, V229, V235 — keep them in sync).
 
+2026-10-23, after a Mộc Châu plan read like a list of addresses: rules 12 (season first) and 13 (a
+restaurant or club is never a sight), each day one loop out of the base with the farthest sight first,
+signature dishes across the meals, stop guides written like Vietnamese bloggers' trip reports (why this
+hour, what to order, famous entry fees as approximate figures, no filler), and a trip overview of 3-5
+practical lines instead of 2 sentences. Research in .docs/AI_TRIP_PLANNING_KNOWLEDGE.md §F.
+
 Prompt layout (2026-10-13 rewrite, see .docs/AI_TRIP_PLANNING_KNOWLEDGE.md §E):
 - everything static first (identity, rules, input legend, output contract) so providers with
   prefix caching bill it as cached input; the traveller profile and the task come last;
@@ -49,7 +55,8 @@ DEFAULT_PLAN_RULES = """\
    - Breakfast is breakfast food (phở, bún, bánh mì, xôi, cháo, bánh cuốn, cơm tấm...) at a venue tagged breakfast or clearly serving it. A cafe or dessert place is a break after a meal (at most one per day), not a meal.
    - Street breakfast sells out by ~09:30 and many kitchens pause 14:00-17:00; after 13:30 choose a restaurant, not a stall.
    - Evenings in Vietnam continue after dinner: a night market, walking street, riverside or late-night snack (ăn đêm, chè) is the default evening block when the profile allows it.
-3. Geography: give each half-day ONE area and write it in the day's "area" field before the stops; consecutive stops are neighbours (use lat/lng), and the day crosses the city at most once. Travel time between stops: walking ~4 km/h up to 1.5 km, otherwise taxi/Grab ~20 km/h (~14 km/h in rush hours 07:00-09:00 and 16:00-18:00) plus 5-10 minutes to find a ride. Leave that gap between a stop's end and the next start.
+   - Across the trip the meals carry the destination's signature dishes, a different one at each main meal when the candidates allow (Mộc Châu: bê chao, cá suối nướng, xôi nương, lẩu cá hồi; Hà Nội: phở, bún chả, bánh cuốn). Lunch is near the morning's last stop; dinner is near the base.
+3. Geography: give each half-day ONE area and write it in the day's "area" field before the stops; consecutive stops are neighbours (use lat/lng), and the day crosses the city at most once. Run each day as one loop out of the base (the town centre where travellers sleep): the farthest sight goes first, in the morning, and the day works its way back towards the base. In a spread-out mountain or countryside destination (Mộc Châu, Sa Pa, Hà Giang, Đà Lạt's outskirts) that means one direction per day, never out to one side and across to the other in the same afternoon. Travel time between stops: walking ~4 km/h up to 1.5 km; in a city taxi/Grab ~20 km/h (~14 km/h in rush hours 07:00-09:00 and 16:00-18:00) plus 5-10 minutes to find a ride; on mountain and country roads ~35 km/h by car or motorbike. Leave that gap between a stop's end and the next start.
 4. Opening hours first: arrive after opening, leave at least 30 minutes before closing; missing hours mean unknown, so keep such stops in mainstream daytime hours. Then time-of-day fit:
    - Temples/pagodas at opening (06:30-09:00) or after 16:00 · Museums/galleries 09:00-17:00, ideal 11:00-15:00 as a heat refuge · Wet/morning markets 06:00-09:00
    - Night markets, bars, rooftops, walking streets, shows after 17:30 · Beaches 06:00-09:00 or 16:00-18:30 · Viewpoints at sunrise or 60 min before sunset (~17:15 in Dec, ~18:30 in Jun)
@@ -60,8 +67,10 @@ DEFAULT_PLAN_RULES = """\
 7. Travel between cities is handled outside the plan: output places and rest blocks only.
 8. Discovery style: FAMOUS = mostly high-review-count landmarks; BALANCED = famous anchors plus local favourites; HIDDEN_GEMS = well-rated places with few reviews, plus one famous landmark per day for orientation.
 9. Variety: spread the traveller's interests across the days, vary kinds within a day (two temples in a row is enough), and let the traveller's own words win over every default here.
-10. Wording: each stop gets a short practical guide for this traveller (see "Writing each stop"); the trip description is at most 2 short sentences; everything is grounded in the given data, with no invented facts.
+10. Wording: each stop gets a practical guide for this traveller (see "Writing each stop") and the trip gets an overview (see "Writing the trip overview"); everything is grounded in the given data or stable, widely known facts, with no invented specifics.
 11. Social-video itineraries: keep every social candidate, follow videoSequence above every other ordering rule, and output rows that share an optionGroupId as separate stops with the same time window (the user picks later).
+12. Season first: plan around what makes these dates special here. The season's highlight (a flower or harvest season, cloud hunting, swimming weather, a festival) gets a stop in its best light and is named in the trip overview; a sight whose season is over is left out or described honestly (no blooming fields in the wrong month).
+13. What a row is: its title and kinds decide. A restaurant, food shop, store, bar or club is a meal or a break, never a sight stop, whatever group it came in; a sight stop is somewhere people go to see or do something.
 """
 
 DEFAULT_TRAVELLER_RULES = """\
@@ -102,12 +111,22 @@ DEFAULT_DESCRIPTION_MAX_CHARS = 600
 STOP_WRITING_RULES = """\
 ## Writing each stop
 - "stay": minutes a traveller like this one spends AT the place (travel excluded), as [min, max], e.g. [45, 60] for a noodle shop, [90, 150] for a big museum; make start and end fit it when the day allows.
-- "description": a mini-guide from a friend who knows the place, in the traveller's language. Open with the most useful thing: what to do, see or order here, or why this time of day. Then only the practical notes that matter for THIS stop and THIS traveller: what to try or skip, where to stand for the view or the photo, how to get in and what a ticket costs when the data says so, what to bring or wear (temples: shoulders and knees covered; beaches: swim at flagged zones), cash or card, queues and quiet hours, booking, fit for kids, elderly, wheelchairs or the diet, weather or safety cautions.
+- "description": a mini-guide from a friend who has been there, in the traveller's language, written the way Vietnamese travel bloggers write their own trip reports. Open with the most useful thing: why this stop at this hour (the light, the season, the crowd, the heat), what to do or see, or the dish to order. Then only the practical notes that matter for THIS stop and THIS traveller: what to try or skip, where to stand for the view or the photo, how to get in and what a ticket costs when the data says so, what to bring or wear (temples: shoulders and knees covered; beaches: swim at flagged zones), cash or card, queues and quiet hours, booking, fit for kids, elderly, wheelchairs or the diet, weather or safety cautions.
 - Length and shape: 1-3 sentences for an ordinary stop, up to 5 for a day's anchor; a sentence plus up to 3 short "• " lines when a list reads better. Vary the shape from stop to stop; a market gets "what to look for", a viewpoint "when the light is best", a restaurant "what to order + one tip".
-- Accuracy over colour: use the candidate's own data (desc, menu, tags, price, hours, kinds) and stable, widely known facts about famous places. When unsure, give general advice ("weekends get crowded", "check today's hours") rather than a specific claim; prices, hours, ticket names, phone numbers and dishes come only from the data.
+- A meal stop names what to order: dishes from its menu, else the regional specialty the venue is known for. A sight stop says what to do there and, for a famous paid sight, the entry or photo fee when it is widely known, as an approximate figure ("vé khoảng 150.000đ", "about 150,000₫").
+- Every sentence tells this traveller something they can act on. Filler that would fit any stop ("a great place to visit", "fits the day's route", "enjoy the beautiful scenery") is left out.
+- Accuracy over colour: use the candidate's own data (desc, menu, tags, price, hours, kinds) and stable, widely known facts about famous places. When unsure, give general advice ("weekends get crowded", "check today's hours") rather than a specific claim; a venue's hours, phone number, own prices and dishes come only from the data.
 - Leave out the stop's name, address, times and the stay estimate: the app shows them already.
 - Rest blocks: one short line on how to use the break.
-- Vietnamese text addresses the reader as "bạn" in a warm, friendly voice (never "quý khách"); English text addresses "you". Place names and dish names stay in their original spelling."""
+- Vietnamese text addresses the reader as "bạn" in a warm, friendly voice (never "quý khách"); English text addresses "you". Place names and dish names stay in their original spelling.
+
+## Writing the trip overview ("tripDescription")
+What a friend tells you before you leave, in the traveller's language: 3-5 lines, each starting with "• ", each concrete for THESE dates and THIS traveller.
+• The dates: what makes them special here (the season's highlight), the weather and temperature range, what to wear or bring.
+• Getting around: where to base, how to move (motorbike, taxi, car with driver), how far the far sights are and which day they are on.
+• Food: 2-4 signature dishes to try and which meals in the plan serve them.
+• One tip that saves time, money or trouble: book ahead, carry cash, a fee, fog on a pass, a closing day, weekend crowds.
+No marketing phrases and no repeat of the stop list."""
 
 # Legend for the candidate rows; static, so it belongs to the cached prefix.
 INPUT_LEGEND = """\
@@ -128,7 +147,7 @@ Treat price, tags and menu as facts: breakfast goes to breakfast-tagged venues o
 
 OUTPUT_CONTRACT = """\
 ## Output (JSON only) — exactly one entry in "days" per planned day, in the listed order
-{"tripDescription":"...","days":[{"dayNumber":1,"area":"morning area → afternoon area","stops":[
+{"tripDescription":"• ...\\n• ...\\n• ...","days":[{"dayNumber":1,"area":"morning area → afternoon area","stops":[
   {"id":"f3","start":"07:30","end":"08:15","stay":[30,45],"description":"..."},
   {"id":"a7","start":"08:30","end":"10:00","stay":[60,90],"description":"..."},
   {"rest":"hotel","start":"12:30","end":"14:30","description":"..."}
@@ -141,7 +160,10 @@ SELF_CHECK = """\
 - no id used twice in the trip; every id exists in the input; "area" named
 - stops chronological, inside opening hours, with travel gaps; no outdoor sight 10:30-15:30 in hot months
 - the hard constraints (dietary, mobility, children, elderly) and the traveller's own words are respected
-- the stop count matches the pace and the profile"""
+- the stop count matches the pace and the profile
+- each day is one loop out of the base, farthest first, with no back-and-forth across the destination
+- no restaurant, shop, bar or club used as a sight; every meal names a dish; no stock filler sentences
+- tripDescription has the dates, getting around, food and tip lines"""
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -235,6 +257,6 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
 
 ## Task
 Destination: {destination}. Plan {days} day(s): {day_list}.{extra}
-Fill every day from morning to evening according to the traveller profile. Write all free text in {language(locale)}. Each stop description is at most {max_chars} characters; tripDescription at most 2 short sentences.
+Fill every day from morning to evening according to the traveller profile. Write all free text in {language(locale)}. Each stop description is at most {max_chars} characters; tripDescription follows "Writing the trip overview" in at most 700 characters.
 
 {SELF_CHECK}"""

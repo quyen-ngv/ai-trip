@@ -66,7 +66,10 @@ async def test_a_claude_tier_needs_only_provider_and_key(monkeypatch, claude):
     monkeypatch.setenv("CHEAPC_LLM_PROVIDER", "anthropic")
     monkeypatch.setenv("CHEAPC_LLM_API_KEY", "sk-ant")
     fake = claude(_answer({"type": "thinking", "thinking": "", "signature": "s"}, _text('{"ok": true}'),
-                          usage={"input_tokens": 50, "cache_read_input_tokens": 900, "output_tokens": 30}))
+                          usage={"input_tokens": 50, "cache_read_input_tokens": 900, "output_tokens": 30,
+                                 "cache_creation_input_tokens": 300,
+                                 "cache_creation": {"ephemeral_5m_input_tokens": 100,
+                                                    "ephemeral_1h_input_tokens": 200}}))
     entries = []
 
     async def sink(entry):
@@ -82,12 +85,14 @@ async def test_a_claude_tier_needs_only_provider_and_key(monkeypatch, claude):
         ai_log.unbind(binding)
 
     [params] = fake.calls
-    assert params["system"] == "rules" and params["messages"] == [{"role": "user", "content": '{"x":1}'}]
+    assert params["system"] == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}]
+    assert params["messages"] == [{"role": "user", "content": '{"x":1}'}]
     assert "temperature" not in params and "response_format" not in params
     assert params["max_tokens"] == 4096 and params["cache_control"] == {"type": "ephemeral"}
     [entry] = entries
     assert (entry["provider"], entry["status"]) == ("anthropic", "SUCCEEDED")
-    assert (entry["inputTokens"], entry["cachedInputTokens"], entry["outputTokens"]) == (950, 900, 30)
+    assert (entry["inputTokens"], entry["cachedInputTokens"], entry["outputTokens"]) == (1250, 900, 30)
+    assert (entry["cacheWrite5mTokens"], entry["cacheWrite1hTokens"]) == (100, 200)
 
 
 @pytest.mark.asyncio
@@ -113,12 +118,16 @@ async def test_pengoo_tool_round_sends_claude_blocks_back_verbatim(monkeypatch, 
 
     assert second["content"] == "Phở Ngọc Béo nhé."
     sent = fake.calls[1]
-    assert sent["system"] == "You are Pengoo."
+    # Pengoo keeps its static prefix for an hour and answers at low effort (chat_model.py).
+    assert sent["system"] == [{"type": "text", "text": "You are Pengoo.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+    assert sent["output_config"] == {"effort": "low"}
     assert sent["tools"][0]["input_schema"]["properties"]["query"] == {"type": "string"}
     assert sent["messages"][1] == {"role": "assistant", "content": [thinking, call]}
+    # The mid-turn note rides after the tool results in the same user turn, never as role "system".
     assert sent["messages"][2] == {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"places": []}'}]}
-    assert sent["messages"][3] == {"role": "system", "content": "Budget used."}
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"places": []}'},
+        {"type": "text", "text": "<system-reminder>Budget used.</system-reminder>"}]}
+    assert len(sent["messages"]) == 3
 
 
 @pytest.mark.asyncio
@@ -175,6 +184,32 @@ async def test_claude_web_search_resumes_a_paused_turn_and_reports_its_sources(c
     assert ai_log.responses_usage(result.value)[3] == 1
 
 
+def test_anthropic_usage_sums_resumed_answers_and_splits_cache_writes():
+    usage = ai_log.anthropic_usage([
+        {"usage": {"input_tokens": 10, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 40,
+                   "output_tokens": 3, "server_tool_use": {"web_search_requests": 2}}},
+        {"usage": {"input_tokens": 1, "cache_creation_input_tokens": 30,
+                   "cache_creation": {"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 20},
+                   "output_tokens": 4}},
+    ])
+
+    assert usage == {"input": 86, "cached": 5, "cache_write_5m": 50, "cache_write_1h": 20, "output": 7,
+                     "searches": 2}
+    assert ai_log.anthropic_usage(None) is None
+
+
 def test_web_search_uses_dynamic_filtering_off_haiku():
     params = anthropic_adapter.web_search_params("claude-sonnet-5-5", {"input": "q"})
     assert params["tools"][0]["type"] == "web_search_20260209"
+
+
+def test_static_system_prompt_keeps_its_own_cache_point():
+    """Pengoo sends its rules, then the per-question context: only the rules carry the marker, so
+    the next question reads them from the cache even though the context changed."""
+    from app.anthropic_adapter import messages_params
+    params = messages_params("claude-sonnet-5", {"messages": [
+        {"role": "system", "content": "RULES"}, {"role": "system", "content": "Now: 10:00"},
+        {"role": "user", "content": "hi"}]})
+    assert params["system"] == [{"type": "text", "text": "RULES", "cache_control": {"type": "ephemeral"}},
+                                {"type": "text", "text": "Now: 10:00"}]
+    assert params["cache_control"] == {"type": "ephemeral"}

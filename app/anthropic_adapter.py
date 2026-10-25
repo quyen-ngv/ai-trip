@@ -122,7 +122,15 @@ def messages_params(model: str, body: dict) -> dict:
         if role == "system" and not messages:
             system.append(_text(message.get("content")))
         elif role == "system":
-            messages.append({"role": "system", "content": _text(message.get("content"))})
+            # A note added mid-conversation (tool budget spent, "act now") rides in the user turn as
+            # a text block after the tool results: role "system" inside messages is refused by some
+            # models (Sonnet 5), and the note must stay where it was put for the history to stay
+            # append-only (thinking blocks are bound to the exact conversation before them).
+            note = {"type": "text", "text": "<system-reminder>" + _text(message.get("content")) + "</system-reminder>"}
+            if messages and messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list):
+                messages[-1]["content"].append(note)
+            else:
+                messages.append({"role": "user", "content": [note]})
         elif role == "assistant":
             messages.append({"role": "assistant", "content": _assistant_content(message)})
         elif role == "tool":
@@ -141,7 +149,7 @@ def messages_params(model: str, body: dict) -> dict:
                               # Caches the longest stable prefix (system prompt, tool list, history).
                               "cache_control": {"type": "ephemeral"}}
     if system:
-        params["system"] = "\n\n".join(system)
+        params["system"] = system_blocks(system, body.get("cache_ttl"))
     effort = _effort(body.get("reasoning_effort"))
     if effort:
         params["output_config"] = {"effort": effort}
@@ -151,6 +159,20 @@ def messages_params(model: str, body: dict) -> dict:
                             "input_schema": t.get("parameters") or {"type": "object", "properties": {}}}
                            for t in tools]
     return params
+
+
+def system_blocks(system: list[str], ttl: str | None = None) -> list[dict]:
+    """The leading system messages as separate text blocks, the first one marked as a cache
+    breakpoint. Callers put their static prompt first and per-request context after it. Joined
+    into one string, the per-request part changed the block, so every new question re-read the
+    ~16k-token static prefix uncached: the automatic breakpoint only lands at the end of the
+    conversation. The explicit marker gives the static part its own read point; automatic caching
+    still covers the growing tail. `ttl` ("1h") keeps that read point alive between questions that
+    come more than five minutes apart; a longer TTL before a shorter automatic one is allowed."""
+    blocks: list[dict] = [{"type": "text", "text": text} for text in system if text.strip()]
+    if blocks:
+        blocks[0]["cache_control"] = {"type": "ephemeral", "ttl": ttl} if ttl in ("1h",) else {"type": "ephemeral"}
+    return blocks
 
 
 def chat_completion(message: dict) -> dict:

@@ -6,10 +6,19 @@ reported here to Java's `ai_api_calls` log. Claude endpoints go through the offi
 (`anthropic_adapter.py`), which translates to and from these OpenAI shapes, so callers never branch
 on the provider. Speech-to-text lives in `transcription.py`.
 
-An `Endpoint` comes from a configured tier (`from_tiers`: the env triple
-<PREFIX>_BASE_URL/_API_KEY/_MODEL, or <PREFIX>_PROVIDER=anthropic with <PREFIX>_API_KEY) or from a
-provider name (`from_provider`: the social pipeline, whose provider and model the admin picks in
-`SOCIAL_LOCATION.AI_PROVIDER`/`AI_MODEL`). An endpoint on api.anthropic.com is a Claude endpoint.
+Configuration is one switch, AI_PROVIDER (claude | openai | deepseek), and per provider a key, a
+main model and a cheap model:
+
+    CLAUDE_API_KEY    CLAUDE_MODEL    CLAUDE_CHEAP_MODEL      both default to claude-haiku-5-5
+    OPENAI_API_KEY    OPENAI_MODEL    OPENAI_CHEAP_MODEL      gpt-6-luna; cheap defaults to main
+    DEEPSEEK_API_KEY  DEEPSEEK_MODEL  DEEPSEEK_CHEAP_MODEL    deepseek-v4-flash; cheap to main
+
+The main model plans itineraries, answers in Pengoo and extracts places from social videos; the
+cheap one (tier CHEAP_LLM) writes research queries, searches and curates the web and runs the
+social topic pre-filter. A tier (CHEAP_LLM, QUALITY_LLM, ASSISTANT_LLM) can still be pinned on its
+own with <PREFIX>_PROVIDER / _BASE_URL / _API_KEY / _MODEL: each value set there wins over the
+switch. A social job may name its own provider and model (admin config SOCIAL_LOCATION.AI_PROVIDER /
+AI_MODEL, empty by default). An endpoint on api.anthropic.com is a Claude endpoint.
 """
 from __future__ import annotations
 
@@ -53,12 +62,38 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+_CHEAP_TIERS = ("CHEAP_LLM",)
+
+
+def _provider_name(value: str | None) -> str:
+    name = (value or "").strip().upper()
+    return "ANTHROPIC" if name == "CLAUDE" else name
+
+
+def provider_defaults(provider: str | None = None, *, cheap: bool = False) -> Endpoint:
+    """The switch's endpoint for a provider (AI_PROVIDER when none is named): its host, key and
+    main or cheap model. Fields stay blank for an unknown provider or a missing key."""
+    name = _provider_name(provider or _env("AI_PROVIDER"))
+    if name == "ANTHROPIC":
+        model = _env("CLAUDE_CHEAP_MODEL" if cheap else "CLAUDE_MODEL") or anthropic_adapter.DEFAULT_MODEL
+        return Endpoint(anthropic_adapter.DEFAULT_BASE_URL, _env("CLAUDE_API_KEY") or _env("ANTHROPIC_API_KEY"),
+                        model, name)
+    if name == "OPENAI":
+        main = _env("OPENAI_MODEL") or _env("OPENAI_CHAT_MODEL") or "gpt-6-luna"
+        return Endpoint("https://api.openai.com/v1", _env("OPENAI_API_KEY"),
+                        (_env("OPENAI_CHEAP_MODEL") or main) if cheap else main, name)
+    if name == "DEEPSEEK":
+        main = _env("DEEPSEEK_MODEL") or "deepseek-v4-flash"
+        return Endpoint((_env("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/"), _env("DEEPSEEK_API_KEY"),
+                        (_env("DEEPSEEK_CHEAP_MODEL") or main) if cheap else main, name)
+    return Endpoint("", "", "", name)
+
+
 def _tier(prefix: str) -> Endpoint:
-    """<PREFIX>_PROVIDER=anthropic fills in Claude's host and default model (Haiku 5.5)."""
-    claude = _env(f"{prefix}_PROVIDER").lower() in ("anthropic", "claude")
-    base_url = _env(f"{prefix}_BASE_URL") or (anthropic_adapter.DEFAULT_BASE_URL if claude else "")
-    model = _env(f"{prefix}_MODEL") or (anthropic_adapter.DEFAULT_MODEL if claude else "")
-    return Endpoint(base_url.rstrip("/"), _env(f"{prefix}_API_KEY"), model, prefix)
+    """The switch's endpoint for this tier, with any <PREFIX>_* value set on its own taking over."""
+    base = provider_defaults(_env(f"{prefix}_PROVIDER") or None, cheap=prefix in _CHEAP_TIERS)
+    return Endpoint((_env(f"{prefix}_BASE_URL") or base.base_url).rstrip("/"),
+                    _env(f"{prefix}_API_KEY") or base.api_key, _env(f"{prefix}_MODEL") or base.model, prefix)
 
 
 def tier_configured(prefix: str) -> bool:
@@ -70,28 +105,25 @@ def from_tiers(*prefixes: str) -> Endpoint:
     return _tier(next((prefix for prefix in prefixes if tier_configured(prefix)), prefixes[0]))
 
 
-def from_provider(provider: str | None, model: str | None = None, base_url: str | None = None) -> Endpoint:
-    """Provider name (ANTHROPIC|CLAUDE, DEEPSEEK, OPENAI, OPENAI_COMPATIBLE) plus optional overrides,
-    falling back to AI_PROVIDER / AI_MODEL / AI_BASE_URL and the provider's own key and defaults.
+def from_provider(provider: str | None, model: str | None = None, base_url: str | None = None, *,
+                  cheap: bool = False) -> Endpoint:
+    """Provider name (ANTHROPIC|CLAUDE, DEEPSEEK, OPENAI, OPENAI_COMPATIBLE; AI_PROVIDER when none,
+    DEEPSEEK when that is empty too) plus optional model and host overrides; otherwise the
+    provider's main model, or its cheap one with `cheap`. OPENAI_COMPATIBLE reads AI_BASE_URL,
+    AI_API_KEY and AI_MODEL.
 
     Raises ValueError for an unknown provider and RuntimeError when a key, model or URL is missing."""
-    name = (provider or _env("AI_PROVIDER") or "DEEPSEEK").strip().upper()
-    name = "ANTHROPIC" if name == "CLAUDE" else name
-    model = (model or _env("AI_MODEL")).strip()
-    base_url = (base_url or _env("AI_BASE_URL")).strip()
-    if name == "ANTHROPIC":
-        model = model or _env("CLAUDE_MODEL", anthropic_adapter.DEFAULT_MODEL)
-        base_url = base_url or anthropic_adapter.DEFAULT_BASE_URL
-        api_key = _env("ANTHROPIC_API_KEY")
-    elif name == "DEEPSEEK":
-        model = model or "deepseek-v4-flash"
-        base_url = base_url or _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        api_key = _env("DEEPSEEK_API_KEY")
-    elif name == "OPENAI":
-        model = model or _env("OPENAI_CHAT_MODEL", "gpt-6-luna")
-        base_url = base_url or "https://api.openai.com/v1"
-        api_key = _env("OPENAI_API_KEY")
+    name = _provider_name(provider or _env("AI_PROVIDER") or "DEEPSEEK")
+    model = (model or "").strip()
+    base_url = (base_url or "").strip()
+    if name in ("ANTHROPIC", "DEEPSEEK", "OPENAI"):
+        defaults = provider_defaults(name, cheap=cheap)
+        model = model or defaults.model
+        base_url = base_url or defaults.base_url
+        api_key = defaults.api_key
     elif name == "OPENAI_COMPATIBLE":
+        model = model or _env("AI_MODEL")
+        base_url = base_url or _env("AI_BASE_URL")
         api_key = _env("AI_API_KEY")
     else:
         raise ValueError(f"Unsupported AI provider: {name}")
@@ -308,14 +340,25 @@ async def _claude_chat(endpoint: Endpoint, body: dict, *, operation: str, timeou
     except Exception as exc:  # SDK status errors, network, refusal
         result.error, result.retryable = anthropic_adapter.status_error(exc)
         logger.error("%s %s error: %s: %s", operation, endpoint.model, type(exc).__name__, exc)
-    input_tokens, cached, output_tokens = ai_log.chat_usage(result.data)
-    logger.info("%s usage model=%s prompt=%s cached=%s completion=%s", operation, endpoint.model,
-                input_tokens, cached, output_tokens)
+    usage = _claude_log_usage(raw)
+    logger.info("%s usage model=%s prompt=%s cached=%s cache_write=%s/%s completion=%s", operation,
+                endpoint.model, usage.get("input_tokens"), usage.get("cached_input_tokens"),
+                usage.get("cache_write_5m_tokens"), usage.get("cache_write_1h_tokens"), usage.get("output_tokens"))
     await ai_log.report(operation=operation, provider="anthropic", model=endpoint.model, ok=result.ok,
-                        request=params, response=raw, error=result.error, input_tokens=input_tokens,
-                        cached_input_tokens=cached, output_tokens=output_tokens,
+                        request=params, response=raw, error=result.error, **usage,
                         latency_ms=int((time.monotonic() - started) * 1000))
     return result
+
+
+def _claude_log_usage(raw: Any) -> dict[str, int]:
+    """`ai_log.report` token arguments read from the raw Messages answer(s), so cache writes keep
+    their own (higher) price; empty when no answer came back."""
+    usage = ai_log.anthropic_usage(raw)
+    if usage is None:
+        return {}
+    return {"input_tokens": usage["input"], "cached_input_tokens": usage["cached"],
+            "cache_write_5m_tokens": usage["cache_write_5m"], "cache_write_1h_tokens": usage["cache_write_1h"],
+            "output_tokens": usage["output"]}
 
 
 async def _claude_web_search(endpoint: Endpoint, body: dict, *, operation: str, timeout: float) -> Result:
@@ -330,9 +373,10 @@ async def _claude_web_search(endpoint: Endpoint, body: dict, *, operation: str, 
     except Exception as exc:
         result.error, _ = anthropic_adapter.status_error(exc)
         logger.warning("%s request failed: %s", operation, exc)
-    input_tokens, cached, output_tokens, searches = ai_log.responses_usage(result.data)
+    billed = (ai_log.anthropic_usage(raw) or {}).get("searches") or 0
+    # Claude reports the searches it bills; counting result blocks is the fallback.
+    searches = billed or ai_log.responses_usage(result.data)[3]
     await ai_log.report(operation=operation, provider="anthropic", model=endpoint.model, ok=result.ok,
-                        request=params, response=raw or None, error=result.error, input_tokens=input_tokens,
-                        cached_input_tokens=cached, output_tokens=output_tokens, web_search_calls=searches,
-                        latency_ms=int((time.monotonic() - started) * 1000))
+                        request=params, response=raw or None, error=result.error, **_claude_log_usage(raw),
+                        web_search_calls=searches, latency_ms=int((time.monotonic() - started) * 1000))
     return result

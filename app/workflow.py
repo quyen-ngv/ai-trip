@@ -101,10 +101,14 @@ class JavaClient:
             r.raise_for_status()
             return r.json().get("data") or []
 
-    async def ai_call(self, entry: dict) -> None:
-        """One AI provider call for the call log. Short timeout: the log must not slow the job."""
+    async def ai_call(self, entry: dict) -> Any:
+        """One AI provider call for the call log. Short timeout: the log must not slow the job.
+        Java answers with the user's credit status (see ai_log.credit_exhausted)."""
         async with httpx.AsyncClient(timeout=10) as c:
-            (await c.post(self.root + "/ai-calls", headers=self.headers, json=entry)).raise_for_status()
+            r = await c.post(self.root + "/ai-calls", headers=self.headers, json=entry)
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+            return data.get("data") if isinstance(data, dict) else None
 
     async def commit(self, items: list[dict], description: str) -> Any:
         body = {"attemptId": self.job["attemptId"], "items": items, "tripDescription": description}
@@ -283,14 +287,32 @@ def description_chars(configured: int, days: int) -> int:
 
 
 def plan_max_tokens(days: int, chars: int) -> int:
-    """About 8 stops a day, each ~chars/2.5 tokens of text plus ~30 of JSON, on top of a fixed part."""
+    """About 8 stops a day, each ~chars/2.5 tokens of text plus ~30 of JSON, a fixed part for the
+    trip overview, and room for reasoning: thinking models (Claude, GPT-5) count their thinking
+    against this cap, and a 2-day plan capped at 12,000 was cut off before its JSON closed, which
+    sent it to the code-only fallback (generic notes, "Travel to …" rows)."""
     per_day = 8 * (int(chars / 2.5) + 30)
-    return max(12000, min(32000, 3000 + per_day * days))
+    return max(30000, min(48000, 3500 + REASONING_TOKENS + per_day * days))
+
+
+# Headroom for the model's own reasoning, on top of the answer itself.
+REASONING_TOKENS = 10000
 
 
 def plan_timeout_seconds(days: int) -> int:
-    """Long answers take longer to generate: two minutes plus 25 seconds a day, at most ten."""
-    return min(600, 120 + 25 * days)
+    """Long answers take longer to generate: three minutes plus 30 seconds a day, at most ten. A
+    2-day plan on Claude Sonnet took 90 s to write 12,000 tokens, so the larger token cap needs
+    the longer wait."""
+    return min(600, 180 + 30 * days)
+
+
+# The planner reasons at medium effort: the plan is long structured output, and at the provider's
+# default (high) Claude spent the whole token cap thinking before the JSON closed.
+PLAN_REASONING_EFFORT = "medium"
+
+
+def _has_days(answer: Any) -> bool:
+    return isinstance(answer, dict) and isinstance(answer.get("days"), list) and bool(answer["days"])
 
 
 def _looks_breakfast(r: dict) -> bool:
@@ -302,7 +324,6 @@ FALLBACK_DESC = {
     "vi": "Lịch trình được cân bằng theo sở thích, khoảng cách di chuyển và giờ mở cửa của từng địa điểm.",
     "en": "An itinerary balanced around your interests, travel distances and each place's opening hours.",
 }
-FALLBACK_NOTE = {"vi": "Phù hợp với nhịp độ và tuyến đường trong ngày.", "en": "Fits the day's pace and route."}
 
 
 # ------------------------------------------------------------------ graph
@@ -442,6 +463,7 @@ async def build_workflow(job: dict[str, Any], token: str):
         return {"raw_web": raw_web}
 
     async def curate_web(s: State):
+        ai_log.require_credit()   # every model step from here on stops once the user is out of credit
         await java.event("WEB_CURATING", 38, "ai_trip.web_curating")
         curated: list[list[dict]] = []
         for i, rows in enumerate(s.get("raw_web") or []):
@@ -488,6 +510,7 @@ async def build_workflow(job: dict[str, Any], token: str):
         return {"inventories": inventories}
 
     async def plan(s: State):
+        ai_log.require_credit()
         await java.event("DEEP_SELECT", 50, "ai_trip.deep_select")
         cfg = s.get("cfg") or {}
         max_chars = int(cfg.get(KEY_DESCRIPTION_MAX_CHARS) or DEFAULT_DESCRIPTION_MAX_CHARS)
@@ -529,10 +552,22 @@ async def build_workflow(job: dict[str, Any], token: str):
             }
             # Output grows with the number of days (every stop has a description); a fixed cap cut
             # long trips off and sent them to the code-only fallback.
-            out = await model.json(system, payload, max_tokens=plan_max_tokens(len(dates), chars),
+            max_tokens = plan_max_tokens(len(dates), chars)
+            out = await model.json(system, payload, max_tokens=max_tokens,
                                    temperature=0.5, cache=False, operation="PLAN_ITINERARY",
-                                   cache_key="ai-trip-plan", timeout=plan_timeout_seconds(len(dates)))
-            logger.info("plan %s: food=%d acts=%d days=%d llm=%s", d.get("name"), len(food), len(acts), len(dates), out is not None)
+                                   cache_key="ai-trip-plan", timeout=plan_timeout_seconds(len(dates)),
+                                   reasoning_effort=PLAN_REASONING_EFFORT)
+            if not _has_days(out):
+                # One more try, with more room: a cut-off or malformed answer is not retried by the
+                # provider layer, and the code-only fallback writes no guide at all, so a second
+                # call costs less than a plan nobody can use.
+                logger.warning("plan %s: unusable answer, asking once more", d.get("name"))
+                ai_log.require_credit()
+                out = await model.json(system, payload, max_tokens=min(64000, int(max_tokens * 1.5)),
+                                       temperature=0.5, cache=False, operation="PLAN_ITINERARY_RETRY",
+                                       cache_key="ai-trip-plan", timeout=plan_timeout_seconds(len(dates)),
+                                       reasoning_effort=PLAN_REASONING_EFFORT)
+            logger.info("plan %s: food=%d acts=%d days=%d llm=%s", d.get("name"), len(food), len(acts), len(dates), _has_days(out))
             return resolve_refs(out, refs)
 
         answers = await asyncio.gather(*(ask(i) for i in range(len(dests))))
@@ -560,12 +595,13 @@ async def build_workflow(job: dict[str, Any], token: str):
                 logger.warning("AI itinerary unusable for %s (%s); using code-only fallback", d.get("name"), e)
                 dest_items, _, notes = schedule_destination(rows, day_numbers, dates, pace, center, locale, used,
                                                             first_day_delay=first_day_delay)
-                # No LLM wording in the fallback: use the place's own blurb, else a neutral line.
+                # No LLM wording in the fallback: use the place's own blurb, else nothing (a stock
+                # line such as "fits the day's pace" told the traveller nothing).
                 blurbs = {row_key(r): (r.get("description") or "") for r in rows}
                 for it in dest_items:
                     if it["type"] == "TRANSPORT":
                         continue
-                    text = it.get("description") or blurbs.get(it.get("_placeKey")) or FALLBACK_NOTE[locale]
+                    text = it.get("description") or blurbs.get(it.get("_placeKey")) or ""
                     it["description"] = text[:max_chars] or None
             for n in notes:
                 logger.info("itinerary %s: %s", d.get("name"), n)
@@ -598,7 +634,7 @@ async def build_workflow(job: dict[str, Any], token: str):
                     items.append(intercity_transport(d, dests[nxt], last_day, last_end, locale, arrival_day=arrive_day))
         social_context = req.get("socialContext") if isinstance(req.get("socialContext"), dict) else {}
         description = (social_trip_text(social_context)
-                       or " ".join(dict.fromkeys(descriptions)).strip()[:500]
+                       or "\n\n".join(dict.fromkeys(descriptions)).strip()[:1500]
                        or FALLBACK_DESC[locale])
         return {"items": items, "description": description}
 

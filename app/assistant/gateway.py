@@ -52,8 +52,9 @@ class JavaGateway:
         except Exception as exc:
             logger.error("assistant failure not delivered: %s", exc)
 
-    async def ai_call(self, entry: dict) -> None:
-        await self._post("/ai-calls", entry, timeout=10)
+    async def ai_call(self, entry: dict) -> Any:
+        """Logs one model call; Java answers with the asker's credit status."""
+        return await self._post("/ai-calls", entry, timeout=10)
 
 
 class TurnClosed(Exception):

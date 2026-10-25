@@ -22,7 +22,6 @@ DINNER_EARLIEST, DINNER_LATEST = 18 * 60, 20 * 60 + 30
 MORNING_CUTOFF, AFTERNOON_CUTOFF = 13 * 60 + 30, 19 * 60 + 30
 # In-city hops don't get TRANSPORT rows (travel time is still budgeted between stops);
 # a row appears only for genuinely far hops and between destinations.
-MIN_TRANSPORT_KM = 5.0
 
 REST_KINDS = {
     "hotel": {"vi": "Nghỉ ngơi tại khách sạn", "en": "Rest at the hotel", "category": "hotel", "minutes": 90},
@@ -342,32 +341,9 @@ def _visit_item(stop: Stop, day: int, locale: str) -> dict:
     return {key: value for key, value in item.items() if value is not None}
 
 
-def _transport_item(prev: Stop, cur: Stop, day: int, locale: str) -> dict:
-    km, mins, mode = cur.travel_km, cur.travel_min, cur.travel_mode
-    # leave so as to arrive on time; free time (if any) stays before the transport, not after
-    start = max(prev.end, cur.start - mins)
-    short_title = cur.row["title"][:80]  # activities.name is VARCHAR(255); titles can reach 500
-    label = f"Di chuyển đến {short_title}" if locale.startswith("vi") else f"Travel to {short_title}"
-    unit = "phút" if locale.startswith("vi") else "min"
-    return {
-        "type": "TRANSPORT", "name": label, "dayNumber": day, "sortOrder": 0,
-        "startTime": fmt_time(start), "endTime": fmt_time(max(cur.start, start + 1)),
-        "address": prev.row.get("address") or None, "latitude": prev.row.get("latitude"), "longitude": prev.row.get("longitude"),
-        "endAddress": cur.row.get("address") or None, "endLatitude": cur.row.get("latitude"), "endLongitude": cur.row.get("longitude"),
-        "transportMode": mode, "durationValueToNext": mins * 60, "durationToNext": f"{mins} {unit}",
-        "distanceValueToNext": int(km * 1000), "distanceToNext": f"{km:.1f} km",
-    }
-
-
 def items_for_day(day: DayPlan, locale: str) -> list[dict]:
-    out: list[dict] = []
-    prev: Stop | None = None
-    for s in sorted(day.stops, key=lambda x: x.start):
-        if prev is not None and s.travel_km >= MIN_TRANSPORT_KM and s.start > prev.end:
-            out.append(_transport_item(prev, s, day.day_number, locale))
-        out.append(_visit_item(s, day.day_number, locale))
-        prev = s
-    return out
+    # Travel between two stops of a destination is left to the app, which draws each leg itself.
+    return [_visit_item(s, day.day_number, locale) for s in sorted(day.stops, key=lambda x: x.start)]
 
 
 def intercity_transport(from_dest: dict, to_dest: dict, day_number: int, start_minutes: int, locale: str, *,

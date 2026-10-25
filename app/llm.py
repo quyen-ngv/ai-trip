@@ -43,11 +43,15 @@ class CachedModel:
 
     async def json(self, system: str, payload: Any, *, max_tokens: int = 4096, temperature: float = 0.3,
                    cache: bool = True, retries: int = 1, operation: str = "CHAT",
-                   cache_key: str | None = None, timeout: float | None = None) -> Any | None:
+                   cache_key: str | None = None, timeout: float | None = None,
+                   reasoning_effort: str | None = None) -> Any | None:
         """Call the model and return the parsed JSON (object or array). None on failure.
 
         `cache_key` is the provider-side prompt cache routing key (OpenAI `prompt_cache_key`):
-        requests sharing a static system prefix land on the same cache. Only sent to OpenAI."""
+        requests sharing a static system prefix land on the same cache. Only sent to OpenAI.
+
+        `reasoning_effort` bounds a thinking model's reasoning (Claude `output_config.effort`, OpenAI
+        reasoning models); a host that rejects the field gets the request again without it."""
         if not self.configured:
             logger.error("LLM %s not configured", self.prefix)
             return None
@@ -64,6 +68,8 @@ class CachedModel:
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         if cache_key and "openai.com" in self.url:
             body["prompt_cache_key"] = cache_key
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
         logger.info("LLM call %s model=%s system=%d chars payload=%d chars", self.prefix, self.model, len(system), len(user))
         for attempt in range(retries + 1):
             result = await providers.chat(self.endpoint, body, operation=operation,

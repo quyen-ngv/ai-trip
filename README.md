@@ -34,8 +34,9 @@ time, in what order, rest blocks, and all wording. Code never re-plans. It only:
 - guards the answer against what Java's commit rejects (unknown/duplicate ids, overlapping or
   invalid times, PLACE_VISIT without placeId, over-long strings),
 - guarantees three meals a day (adds the nearest suitable venue when the model skips one),
-- emits TRANSPORT rows only for hops ≥ 5 km and between destinations,
-- falls back to a code-only itinerary (`scheduler.py`) if the model's JSON is unusable.
+- emits TRANSPORT rows only between destinations (the app draws the legs inside a destination),
+- asks the planner once more (`PLAN_ITINERARY_RETRY`, 1.5× `max_tokens`) when its JSON is unusable,
+  then falls back to a code-only itinerary (`scheduler.py`).
 
 ```
 validate → retrieve → [select_candidates | web_research] → curate_web → resolve_places → plan → verify → commit
@@ -89,8 +90,12 @@ How the prompt is built (2026-10-13; research in `.docs/AI_TRIP_PLANNING_KNOWLED
 | Var | Purpose |
 |---|---|
 | `AI_TRIP_INTERNAL_TOKEN` | Shared secret with Java. |
-| `QUALITY_LLM_BASE_URL/_API_KEY/_MODEL` | Quality model for final itinerary planning. Falls back to `CHEAP_LLM_*` only for that planning call. |
-| `CHEAP_LLM_BASE_URL/_API_KEY/_MODEL` | Required for Web research: it writes contextual queries and invokes the Responses `web_search` tool. Its endpoint/model must support Responses Web Search; this stage never falls back to the quality model. |
+| `AI_PROVIDER` | The one switch: `claude`, `openai` or `deepseek` (shared with goroute-app). Every tier and social job uses that provider's key and models below. |
+| `CLAUDE_API_KEY` (or `ANTHROPIC_API_KEY`), `CLAUDE_MODEL`, `CLAUDE_CHEAP_MODEL` | Claude through the official SDK; both models default to `claude-haiku-5-5`. |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_CHEAP_MODEL` | Default `gpt-6-luna`; the cheap model defaults to the main one. Web research needs a model with Responses Web Search. |
+| `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`, `DEEPSEEK_CHEAP_MODEL` | Default `deepseek-v4-flash`. DeepSeek has no web search, so web research finds nothing. |
+| Main vs cheap | Main (`QUALITY_LLM`, `ASSISTANT_LLM`): itinerary planning, Pengoo, social extraction. Cheap (`CHEAP_LLM`): research queries, web search and curation, social pre-filter. |
+| `CHEAP_LLM_*`, `QUALITY_LLM_*`, `ASSISTANT_LLM_*` (`_PROVIDER/_BASE_URL/_API_KEY/_MODEL`) | Optional pins: each value set wins over the switch for that tier, e.g. `QUALITY_LLM_MODEL=claude-opus-5-5`. |
 | `LLM_CACHE_PATH` | SQLite cache path (planning calls are not cached). |
 | `AI_TRIP_WEB_RESEARCH_BUDGET_SECONDS` | Total browser-research budget per job, split across destinations (default 300). |
 | `AI_TRIP_WEB_RESEARCH_MIN_CANDIDATES_PER_GROUP` | Minimum Web additions sought for Food and each requested spot group even when the catalogue is sufficient (default 3). |
@@ -103,10 +108,10 @@ How the prompt is built (2026-10-13; research in `.docs/AI_TRIP_PLANNING_KNOWLED
 | `AI_TRIP_WEB_CURATION_MAX_PER_GROUP` | Maximum Web candidates sent per group to Java identity resolution (default 12). |
 | `AI_TRIP_CANDIDATES_PER_GROUP` | `/candidates` limit per group (default 120). |
 | `AI_TRIP_LLM_TIMEOUT_SECONDS` | HTTP timeout for the planning call (default 180). |
-| `CHEAP_LLM_PROVIDER`, `QUALITY_LLM_PROVIDER`, `ASSISTANT_LLM_PROVIDER` | `anthropic` (or `claude`) makes that tier Claude: only `_API_KEY` is then required; `_BASE_URL` defaults to `https://api.anthropic.com` and `_MODEL` to `claude-haiku-5-5`. A tier whose `_BASE_URL` is on api.anthropic.com is Claude too. Claude ignores `temperature` and `response_format`; JSON comes from the prompts. |
-| `ASSISTANT_WEB_SEARCH_PROVIDER` | `openai` (default), `claude`, `tinyfish`, `tavily` or `brave`. `claude` searches with Claude using `ASSISTANT_WEB_SEARCH_*`, else the CHEAP_LLM tier when it is Claude, else `ANTHROPIC_API_KEY` with Haiku 5.5. |
-| `AI_PROVIDER` / `AI_MODEL` / `AI_BASE_URL` | Social video defaults when the job names none (`ANTHROPIC`, `DEEPSEEK`, `OPENAI`, `OPENAI_COMPATIBLE`). |
-| `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `AI_API_KEY` | Provider keys for social video calls (`AI_API_KEY` = OPENAI_COMPATIBLE). Defaults: `OPENAI_CHAT_MODEL` (gpt-6-luna), `CLAUDE_MODEL` (claude-haiku-5-5), `DEEPSEEK_BASE_URL`. |
+| `ASSISTANT_WEB_SEARCH_PROVIDER` | `openai` (default): the cheap model searches, with OpenAI Responses or Claude's `web_search` tool, so it follows `AI_PROVIDER`. `claude` forces Claude. `tinyfish`, `tavily`, `brave` use that API (`ASSISTANT_WEB_SEARCH_API_KEY`). |
+| `ASSISTANT_LLM_REASONING_EFFORT` | Effort for Pengoo's model rounds (default `low`; empty = provider default). Claude: `output_config.effort`; OpenAI: `reasoning_effort`, dropped to `none` when the model rejects it with tools. |
+| `ASSISTANT_CACHE_TTL` | Claude only: TTL of the explicit cache breakpoint on Pengoo's static rules (`1h` default, `5m`, or empty for the default). |
+| `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | Only for a social job pinned to `OPENAI_COMPATIBLE`. |
 | `AI_REQUEST_TIMEOUT_SECONDS` / `SOCIAL_AI_REASONING_EFFORT` | Social extraction timeout (default 120; pre-filter at most 30) and the OpenAI reasoning effort override. |
 | `GROQ_API_KEY` / `GROQ_WHISPER_MODEL`, `OPENAI_WHISPER_MODEL` | Speech-to-text: Groq first, then OpenAI, then local Whisper. |
 | `LOCAL_WHISPER_*` | `ENABLED` (true), `MODEL` (small, baked in the image), `DEVICE` (cpu), `COMPUTE_TYPE` (int8), `LANGUAGE` (vi), `CACHE_DIR`, `BEAM_SIZE` (1), `CPU_THREADS` (2). |

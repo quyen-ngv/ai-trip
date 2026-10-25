@@ -6,12 +6,13 @@ with their links. They never become place cards or proposals, because nothing in
 against the catalogue.
 
 Providers (ASSISTANT_WEB_SEARCH_PROVIDER):
-  openai (default)  The OpenAI Responses API with its built-in web_search tool, the same way the
-                    trip planner researches (`research.py`). Uses ASSISTANT_WEB_SEARCH_BASE_URL /
+  openai (default)  The model's own web search, the same way the trip planner researches
+                    (`research.py`): OpenAI Responses web_search, or Claude's web_search tool when
+                    the model is Claude, so it follows AI_PROVIDER. Uses ASSISTANT_WEB_SEARCH_BASE_URL /
                     _API_KEY / _MODEL, falling back to the CHEAP_LLM tier. Logged to ai_api_calls.
   claude            Claude's web_search tool through `providers.responses`. ASSISTANT_WEB_SEARCH_*
                     as above, falling back to the CHEAP_LLM tier when it is Claude, else to
-                    ANTHROPIC_API_KEY with Claude's host and Haiku 5.5.
+                    CLAUDE_API_KEY with CLAUDE_CHEAP_MODEL.
   tinyfish          TinyFish Search (free up to 12,000 a day, 30 a minute); title, url and snippet
                     per result, no model call. Needs ASSISTANT_WEB_SEARCH_API_KEY.
   tavily | brave    A search API; needs ASSISTANT_WEB_SEARCH_API_KEY.
@@ -30,7 +31,7 @@ from typing import Any
 
 import httpx
 
-from .. import ai_log, anthropic_adapter, config, providers
+from .. import ai_log, config, providers
 from ..research import _output_text, _response_sources
 from ..research_cache import ResearchCache
 
@@ -64,7 +65,9 @@ def _cache_store() -> ResearchCache | None:
 _INSTRUCTIONS = """Search the web for the query and answer for a traveller in Vietnam. Return JSON only:
 {"results": [{"title": "...", "url": "https://...", "snippet": "the relevant fact in one or two sentences"}]}
 Use at most 5 results, only from pages you actually read, prefer recent and local sources, and keep
-each snippet factual (names, dates, address, price). No results → {"results": []}."""
+each snippet factual (names, dates, address, price). When the query asks for places (a dish, a kind
+of shop), give one result per place: its name, street or area, and what it is known for. No results →
+{"results": []}."""
 
 
 _MODEL_PROVIDERS = ("openai", "claude", "anthropic")
@@ -83,8 +86,7 @@ def _model_endpoint() -> providers.Endpoint:
         return cheap
     base = cheap
     if provider != "openai" and not cheap.is_claude:
-        base = providers.Endpoint(anthropic_adapter.DEFAULT_BASE_URL, os.getenv("ANTHROPIC_API_KEY", "").strip(),
-                                  anthropic_adapter.DEFAULT_MODEL, "ANTHROPIC")
+        base = providers.provider_defaults("CLAUDE", cheap=True)
 
     def pick(key: str, fallback: str) -> str:
         return os.getenv(f"ASSISTANT_WEB_SEARCH_{key}", "").strip() or fallback
@@ -160,12 +162,23 @@ async def _model_search(client: httpx.AsyncClient, query: str) -> list[dict]:
     return rows[:MAX_RESULTS]
 
 
+async def _report_paid_search(provider: str, request: dict, response: httpx.Response, started: float) -> None:
+    """Logs one paid search as a web search call of model "<provider>-search", so it is charged to
+    the asker's AI credits once AI_PRICING has that model's webSearchPer1k."""
+    ok = response.status_code == 200
+    await ai_log.report(operation="WEB_SEARCH", provider=provider, model=f"{provider}-search", ok=ok,
+                        request=request, response=response.json() if ok else None,
+                        error=None if ok else {"httpStatus": response.status_code, "body": response.text[:4000]},
+                        web_search_calls=1 if ok else 0, latency_ms=int((time.monotonic() - started) * 1000))
+
+
 async def _tavily(client: httpx.AsyncClient, query: str) -> list[dict]:
     key = os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip()
+    body = {"query": query, "max_results": MAX_RESULTS, "search_depth": "basic", "include_answer": False}
+    started = time.monotonic()
     response = await client.post("https://api.tavily.com/search",
-                                 headers={"Authorization": f"Bearer {key}"},
-                                 json={"query": query, "max_results": MAX_RESULTS, "search_depth": "basic",
-                                       "include_answer": False})
+                                 headers={"Authorization": f"Bearer {key}"}, json=body)
+    await _report_paid_search("tavily", body, response, started)
     response.raise_for_status()
     return [_row(item.get("title"), item.get("url"), item.get("content"))
             for item in (response.json().get("results") or [])][:MAX_RESULTS]
@@ -173,9 +186,12 @@ async def _tavily(client: httpx.AsyncClient, query: str) -> list[dict]:
 
 async def _brave(client: httpx.AsyncClient, query: str) -> list[dict]:
     key = os.getenv("ASSISTANT_WEB_SEARCH_API_KEY", "").strip()
+    params = {"q": query, "count": MAX_RESULTS}
+    started = time.monotonic()
     response = await client.get("https://api.search.brave.com/res/v1/web/search",
                                 headers={"X-Subscription-Token": key, "Accept": "application/json"},
-                                params={"q": query, "count": MAX_RESULTS})
+                                params=params)
+    await _report_paid_search("brave", params, response, started)
     response.raise_for_status()
     items = ((response.json().get("web") or {}).get("results")) or []
     return [_row(item.get("title"), item.get("url"), item.get("description")) for item in items][:MAX_RESULTS]
