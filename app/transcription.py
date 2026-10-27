@@ -1,7 +1,7 @@
-"""Speech-to-text for social videos: Groq Whisper, else OpenAI Whisper, else faster-whisper here.
+"""Speech-to-text for social videos: always faster-whisper on this server, never a paid API.
 
-The first provider with a key wins; local Whisper is the fallback when neither key is set. Each
-provider call is reported to the AI call log as TRANSCRIBE_AUDIO.
+The model is baked into the image; LOCAL_WHISPER_ENABLED=false turns transcription off and the
+social pipeline then works from the caption and on-screen text alone.
 """
 from __future__ import annotations
 
@@ -9,13 +9,10 @@ import asyncio
 import logging
 import tempfile
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-from . import ai_log, config
+from . import config
 
 logger = logging.getLogger(__name__)
 _LOCAL_WHISPER = None
@@ -23,45 +20,17 @@ _LOCAL_LOCK = threading.Lock()
 
 
 async def transcribe(audio: bytes, filename: str = "audio.mp3") -> tuple[str, str]:
-    """(transcript, "provider:model"). Raises when a Whisper API answers with an error."""
-    if config.GROQ_API_KEY:
-        return await _api("groq", "https://api.groq.com/openai/v1/audio/transcriptions", config.GROQ_API_KEY,
-                          config.GROQ_WHISPER_MODEL, audio, filename)
-    if config.OPENAI_API_KEY:
-        return await _api("openai", "https://api.openai.com/v1/audio/transcriptions", config.OPENAI_API_KEY,
-                          config.OPENAI_WHISPER_MODEL, audio, filename)
+    """(transcript, "provider:model"), transcribed by local Whisper whatever API keys are set."""
     if config.LOCAL_WHISPER_ENABLED:
         return await asyncio.to_thread(_local, audio, filename)
-    logger.warning("Audio transcription skipped: no GROQ_API_KEY, OPENAI_API_KEY, and LOCAL_WHISPER_ENABLED=false")
+    logger.warning("Audio transcription skipped: LOCAL_WHISPER_ENABLED=false")
     return "", "skipped:no_transcriber"
-
-
-async def _api(provider: str, url: str, key: str, model: str, audio: bytes, filename: str) -> tuple[str, str]:
-    logger.info("Transcribing audio with %s: model=%s", provider, model)
-    started = time.monotonic()
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(url, headers={"Authorization": f"Bearer {key}"}, data={"model": model},
-                                     files={"file": (filename, audio, "audio/mpeg")})
-    body: Any = None
-    try:
-        body = response.json() if response.is_success else None
-    except ValueError:
-        pass
-    await ai_log.report(operation="TRANSCRIBE_AUDIO", provider=provider, model=model, ok=response.is_success,
-                        request={"model": model, "file": filename, "bytes": len(audio)}, response=body,
-                        error=None if response.is_success else {"httpStatus": response.status_code,
-                                                                "body": response.text[:2000]},
-                        latency_ms=int((time.monotonic() - started) * 1000))
-    response.raise_for_status()
-    text = (body or {}).get("text", "").strip()
-    logger.info("%s transcript complete: chars=%s", provider, len(text))
-    return text, f"{provider}:{model}"
 
 
 def warm_up() -> None:
     """Load local Whisper at startup when it is the transcriber jobs will use, so the first social
     video job does not wait for the model to load."""
-    if config.GROQ_API_KEY or config.OPENAI_API_KEY or not config.LOCAL_WHISPER_ENABLED:
+    if not config.LOCAL_WHISPER_ENABLED:
         return
     try:
         with _LOCAL_LOCK:

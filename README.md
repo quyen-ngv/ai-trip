@@ -113,8 +113,7 @@ How the prompt is built (2026-10-13; research in `.docs/AI_TRIP_PLANNING_KNOWLED
 | `ASSISTANT_CACHE_TTL` | Claude only: TTL of the explicit cache breakpoint on Pengoo's static rules (`1h` default, `5m`, or empty for the default). |
 | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | Only for a social job pinned to `OPENAI_COMPATIBLE`. |
 | `AI_REQUEST_TIMEOUT_SECONDS` / `SOCIAL_AI_REASONING_EFFORT` | Social extraction timeout (default 120; pre-filter at most 30) and the OpenAI reasoning effort override. |
-| `GROQ_API_KEY` / `GROQ_WHISPER_MODEL`, `OPENAI_WHISPER_MODEL` | Speech-to-text: Groq first, then OpenAI, then local Whisper. |
-| `LOCAL_WHISPER_*` | `ENABLED` (true), `MODEL` (small, baked in the image), `DEVICE` (cpu), `COMPUTE_TYPE` (int8), `LANGUAGE` (vi), `CACHE_DIR`, `BEAM_SIZE` (1), `CPU_THREADS` (2). |
+| `LOCAL_WHISPER_*` | Speech-to-text always runs here on faster-whisper, never a paid API, whatever keys are set. `ENABLED` (true; false skips transcription), `MODEL` (small, baked in the image), `DEVICE` (cpu), `COMPUTE_TYPE` (int8), `LANGUAGE` (vi), `CACHE_DIR`, `BEAM_SIZE` (1), `CPU_THREADS` (2). |
 | `LOG_LEVEL` | Default INFO. Prompts and payloads are not logged, only their sizes and the provider's token `usage` (`LLM usage ...`, `Web research usage ...`). |
 
 ## Multi-destination trips

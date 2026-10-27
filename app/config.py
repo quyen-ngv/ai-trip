@@ -47,10 +47,7 @@ AI_REQUEST_TIMEOUT_SECONDS = _int("AI_REQUEST_TIMEOUT_SECONDS", 120)
 SOCIAL_AI_REASONING_EFFORT = os.getenv("SOCIAL_AI_REASONING_EFFORT", "").strip().lower()
 
 # Speech-to-text: Groq, else OpenAI, else faster-whisper on this machine.
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_WHISPER_MODEL = os.getenv("OPENAI_WHISPER_MODEL", "whisper-1")
 LOCAL_WHISPER_ENABLED = os.getenv("LOCAL_WHISPER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "small")
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "cpu")
