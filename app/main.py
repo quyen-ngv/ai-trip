@@ -17,7 +17,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="GoRoute AI service: trip worker, Pengoo assistant, social video AI", lifespan=lifespan)
+app = FastAPI(title="Pengoo AI service: trip worker, Pengoo assistant, social video AI", lifespan=lifespan)
 TOKEN = os.getenv("AI_TRIP_INTERNAL_TOKEN", "")
 tasks: set[asyncio.Task] = set()
 

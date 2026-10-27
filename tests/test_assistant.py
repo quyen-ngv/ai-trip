@@ -196,9 +196,9 @@ def test_clean_reply_drops_a_copied_history_card_note():
 
 
 def test_clean_reply_keeps_an_extension_first_so_the_cap_never_drops_it():
-    adds = [{"action": "ADD", "placeId": f"p{i}", "dayNumber": 4} for i in range(6)]
+    adds = [{"action": "ADD", "placeId": f"p{i}", "dayNumber": 4} for i in range(12)]
     reply = clean_reply({"answer": "ok", "proposals": adds + [{"action": "ADD_DAYS", "toDayNumber": "4"}]}, set(), {})
-    assert len(reply["proposals"]) == 6
+    assert len(reply["proposals"]) == 10
     assert reply["proposals"][0] == {"action": "ADD_DAYS", "toDayNumber": 4}
 
 
@@ -213,6 +213,46 @@ def test_clean_reply_keeps_day_change_fields_and_drops_bad_ones():
                                       {"action": "SHIFT_DATES"}, {"action": "PREPEND_DAYS", "days": 2}]
     assert reply["proposals"][3] == {"action": "REPLACE", "activityId": "a1", "placeId": "p2"}
     assert len(reply["proposals"]) == 4
+
+
+def test_trip_edit_proposals_keep_only_the_fields_their_action_takes():
+    reply = clean_reply({"answer": "ok", "proposals": [
+        {"action": "ADD_EXPENSE", "summary": "Vé máy bay 500k",
+         "changes": {"amount": 500000, "currency": "VND", "category": "TRANSPORT", "paidBy": "u1",
+                     "splitWith": ["u1", {"bad": 1}, "g2"], "placeId": "not an expense field"}},
+        {"action": "EDIT_EXPENSE", "expenseId": "e1", "changes": {"amount": "450000", "splitWith": ["u1"]}},
+        {"action": "NEW_ACTIVITY", "dayNumber": "1", "startTime": "08:00",
+         "changes": {"name": " Bay VN123 ", "transportMode": "PLANE", "stay": False}},
+        {"action": "ADD_NOTE", "changes": "not a dict"}]}, set(), {})
+    expense, edit, flight, note = reply["proposals"]
+    assert expense["changes"] == {"amount": 500000, "currency": "VND", "category": "TRANSPORT", "paidBy": "u1",
+                                  "splitWith": ["u1", "g2"]}
+    assert edit == {"action": "EDIT_EXPENSE", "expenseId": "e1", "changes": {"amount": "450000"}}
+    assert flight["dayNumber"] == 1 and flight["changes"] == {"name": "Bay VN123", "transportMode": "PLANE",
+                                                              "stay": False}
+    assert note == {"action": "ADD_NOTE"}
+
+
+def test_photos_go_before_the_question_in_the_last_message():
+    messages = initial_messages({**TURN, "question": "thêm chi phí này"}, ["data:image/jpeg;base64,AAAA"])
+    parts = messages[-1]["content"]
+    assert parts[0] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}
+    assert parts[1]["type"] == "text" and "[sent 1 photo] thêm chi phí này" in parts[1]["text"]
+    assert isinstance(initial_messages(TURN)[-1]["content"], str)
+
+
+@pytest.mark.asyncio
+async def test_photos_are_inlined_and_unreadable_ones_left_out(monkeypatch):
+    from app.assistant import images
+
+    jpeg = bytes([0xFF, 0xD8, 0xFF]) + b"0" * 10
+
+    async def fake_one(client, url):
+        return None if "broken" in url else f"data:image/jpeg;base64,{url[-1]}"
+
+    monkeypatch.setattr(images, "_one", fake_one)
+    assert await images.load(["https://cdn/a", "https://cdn/broken", "ftp://x", 3]) == ["data:image/jpeg;base64,a"]
+    assert images._sniff(jpeg) == "image/jpeg" and images._sniff(b"%PDF-1.7") is None
 
 
 def test_a_place_shared_by_a_member_is_named_in_the_history():

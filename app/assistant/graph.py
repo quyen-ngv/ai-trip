@@ -26,7 +26,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .. import ai_log
-from . import read_url, web_search
+from . import images, read_url, web_search
 from .chat_model import ChatModel
 from .gateway import JavaGateway, TurnClosed
 from .prompts import SYSTEM, history_messages, question_message
@@ -81,7 +81,23 @@ _CARD_NOTE = re.compile(r"\s*\[(?:place cards shown|place): [^\]]*\]")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIME = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 PROPOSAL_ACTIONS = ("ADD", "MOVE", "UPDATE_TIME", "REMOVE", "REPLACE",
-                    "ADD_DAYS", "PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES")
+                    "ADD_DAYS", "PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES",
+                    "EDIT_TRIP", "EDIT_ACTIVITY", "NEW_ACTIVITY", "ADD_EXPENSE", "EDIT_EXPENSE",
+                    "REMOVE_EXPENSE", "ADD_NOTE", "ADD_GUEST")
+MAX_PROPOSALS = 10
+# The field names each trip-information action may set; Java checks every value again.
+_CHANGE_FIELDS = {
+    "EDIT_TRIP": ("name", "description", "budget", "currency", "visibility",
+                  "startingPointName", "startingPointAddress", "startingPointTime"),
+    "EDIT_ACTIVITY": ("name", "address", "endAddress", "notes", "description", "category",
+                      "transportMode", "cost", "costCurrency", "stay"),
+    "NEW_ACTIVITY": ("name", "address", "endAddress", "notes", "description", "category",
+                     "transportMode", "cost", "costCurrency", "stay"),
+    "ADD_EXPENSE": ("amount", "currency", "category", "description", "date", "paidBy", "splitWith"),
+    "EDIT_EXPENSE": ("amount", "category", "description", "date", "paidBy"),
+    "ADD_NOTE": ("content",),
+    "ADD_GUEST": ("guestName",),
+}
 # Changes to the days themselves go first (Java keeps one and the adds it needs).
 _DAY_CHANGES = ("PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES", "ADD_DAYS")
 
@@ -298,6 +314,30 @@ def balance_bold(text: str) -> str:
     return (text[:cut] + text[cut + 2:]).rstrip()
 
 
+def clean_changes(action: str, raw) -> dict:
+    """The fields a trip-information proposal sets: only the names its action takes, scalars (or
+    a list of ids for `splitWith`), strings cut to 2000 characters."""
+    fields = _CHANGE_FIELDS.get(action)
+    if not fields or not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in fields:
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        if key == "splitWith":
+            if isinstance(value, list):
+                ids = [str(v)[:64] for v in value if isinstance(v, (str, int)) and str(v).strip()][:30]
+                if ids:
+                    out[key] = ids
+            continue
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            out[key] = value
+        elif isinstance(value, str):
+            out[key] = value.strip()[:2000]
+    return out
+
+
 def clean_reply(final: dict, allowed_places: set[str], usage: dict,
                 ids: dict[str, set[str]] | None = None) -> dict:
     """What Java receives: bounded lists, places only from this turn's tool results, earlier
@@ -316,8 +356,11 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
         if isinstance(item, dict) and item.get("action") in PROPOSAL_ACTIONS:
             proposal = {key: item.get(key) for key in ("action", "tripId", "dayNumber", "toDayNumber", "days",
                                                        "startDate", "startTime", "endTime", "placeId", "activityId",
-                                                       "category", "summary")
+                                                       "expenseId", "category", "summary")
                         if item.get(key) not in (None, "")}
+            changes = clean_changes(item.get("action"), item.get("changes"))
+            if changes:
+                proposal["changes"] = changes
             for key in ("startTime", "endTime"):
                 if key in proposal and not _TIME.fullmatch(str(proposal[key])):
                     proposal.pop(key)
@@ -336,7 +379,7 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
     proposals.sort(key=lambda p: p["action"] not in _DAY_CHANGES)
     suggestions = [str(s).strip()[:120] for s in (final.get("suggestions") or []) if str(s).strip()][:4]
     answer = balance_bold(_CARD_NOTE.sub("", str(final.get("answer") or "")).strip()[:8000])
-    reply = {"markdown": answer, "places": places[:8], "proposals": proposals[:6], "suggestions": suggestions,
+    reply = {"markdown": answer, "places": places[:8], "proposals": proposals[:MAX_PROPOSALS], "suggestions": suggestions,
              "actions": clean_actions(final.get("actions"), ids or {}),
              "cards": clean_cards(final.get("cards"), ids or {}),
              "destinations": clean_destinations(final.get("destinations"), ids or {}),
@@ -646,11 +689,15 @@ def batch_items(name: str, args: dict) -> list[dict]:
     return [{item_key: value} for value in dict.fromkeys(ids[:cap])]
 
 
-def initial_messages(turn: dict) -> list[dict]:
+def initial_messages(turn: dict, photos: list[str] | None = None) -> list[dict]:
     """The static rules, the chat so far, then one user message with the per-turn context and the
-    question: everything before the last message is a stable prefix for the provider cache."""
+    question: everything before the last message is a stable prefix for the provider cache.
+    Photos sent with the question go in that last message, before its text."""
+    question: Any = question_message(turn, len(photos or []))
+    if photos:
+        question = [{"type": "image_url", "image_url": {"url": url}} for url in photos]             + [{"type": "text", "text": question}]
     return ([{"role": "system", "content": SYSTEM}] + history_messages(turn)
-            + [{"role": "user", "content": question_message(turn)}])
+            + [{"role": "user", "content": question}])
 
 
 async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> None:
@@ -670,6 +717,9 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
             raise RuntimeError("assistant model is not configured")
         if turn.get("trip"):
             await java.step("reading_trip", {})
+        photos = await images.load(turn.get("images") or [])
+        if photos:
+            await java.step("reading_photo", {"count": len(photos)})
         graph = build_graph(turn, java, chosen)
         limits = turn.get("limits") or {}
         # Each agent round plus its tool round is two graph steps; on top of the budget, the rounds
@@ -678,7 +728,7 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
         # Java sends how long it waits before failing the turn itself, minus a margin (a PRO budget
         # of 20 tool calls needs far longer than the old fixed 120 s).
         timeout = int(limits.get("timeoutSeconds") or TURN_TIMEOUT_SECONDS)
-        await asyncio.wait_for(graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0},
+        await asyncio.wait_for(graph.ainvoke({"messages": initial_messages(turn, photos), "tool_calls": 0},
                                              {"recursion_limit": limit}), timeout=timeout)
     except TurnClosed:
         logger.info("assistant turn %s closed by Java before the answer", turn.get("turnId"))

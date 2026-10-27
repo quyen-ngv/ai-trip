@@ -120,6 +120,11 @@ TRIP_TOOLS = [
         "The trip's money so far in its currency: budget, spent, remaining, spent by category, estimates of planned "
         "activities, and the asker's own share. For 'how much have we spent / are we over budget'.",
         {}),
+    _fn("list_expenses",
+        "The trip's logged expenses, newest first (at most 40): id, date, amount, currency, category, description, "
+        "who paid, how many share it. Only to find the id of an expense the user wants changed or removed "
+        "(EDIT_EXPENSE / REMOVE_EXPENSE); `query` filters by words of the description.",
+        {"query": {"type": "string"}}),
 ]
 
 DIRECT_TOOLS = TRIP_TOOLS + [
@@ -127,7 +132,7 @@ DIRECT_TOOLS = TRIP_TOOLS + [
     _fn("get_trip", "Days and activities of one of the user's trips.", {"trip_id": {"type": "string"}}, ["trip_id"]),
 ]
 # In the 1:1 chat these read a trip the user names.
-_NEEDS_TRIP = {"get_budget", "get_trip_checkins", "rank_trip_places"}
+_NEEDS_TRIP = {"get_budget", "get_trip_checkins", "rank_trip_places", "list_expenses"}
 DIRECT_TOOLS = [t for t in DIRECT_TOOLS if t["function"]["name"] not in _NEEDS_TRIP] + [
     _fn("get_budget", "Budget, spending by category and the user's own share for one of their trips.",
         {"trip_id": {"type": "string"}}, ["trip_id"]),
@@ -135,6 +140,8 @@ DIRECT_TOOLS = [t for t in DIRECT_TOOLS if t["function"]["name"] not in _NEEDS_T
         {"trip_id": {"type": "string"}}, ["trip_id"]),
     _fn("rank_trip_places", "Places of one of the user's trips ranked by popularity with app travellers.",
         {"trip_id": {"type": "string"}}, ["trip_id"]),
+    _fn("list_expenses", "Logged expenses of one of the user's trips (ids for EDIT_EXPENSE / REMOVE_EXPENSE).",
+        {"trip_id": {"type": "string"}, "query": {"type": "string"}}, ["trip_id"]),
 ]
 
 WEB_SEARCH = _fn(
@@ -171,7 +178,7 @@ STEP_KEYS = {
     "search_places": "search_places", "get_place_details": "place_details", "get_weather": "weather",
     "search_events": "events", "search_meetups": "meetups", "get_local_dishes": "local_dishes",
     "travel_time": "travel_time", "list_my_trips": "my_trips", "get_trip": "trip_details",
-    "web_search": "web_search", "read_url": "read_page", "get_budget": "budget", "search_public_trips": "public_trips",
+    "web_search": "web_search", "read_url": "read_page", "get_budget": "budget", "list_expenses": "budget", "search_public_trips": "public_trips",
     "get_place_community": "place_community", "get_trip_checkins": "trip_checkins",
     "rank_trip_places": "trip_place_ranking", "explore_destinations": "destinations",
     "get_destination_guide": "destination_guide",

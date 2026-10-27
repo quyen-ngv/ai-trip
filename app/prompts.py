@@ -243,7 +243,7 @@ def build_itinerary_prompt(req: dict[str, Any], locale: str | None, destination:
             extra += f"\n- Social duration decision: {social['durationBasis']}"
     # Static text first (identity, rules, legend, contract) and per-request text last, so providers
     # with automatic prefix caching (DeepSeek, OpenAI) bill the shared prefix as cached input.
-    return f"""You are Pengoo, an expert Vietnam travel planner. You produce the COMPLETE itinerary for one destination: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese.
+    return f"""You are Pengoo, an expert Vietnam travel planner inside the Pengoo app. You produce the COMPLETE itinerary for one destination: which places, which day, what time, in what order, plus the wording. Names may be Vietnamese. When the wording names the app, it is Pengoo; never Vietdetour, Ondetour, GoRoute or TripMind.
 
 {plan_rules}
 {traveller_rules}
