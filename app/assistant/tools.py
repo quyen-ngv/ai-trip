@@ -44,15 +44,32 @@ TRIP_TOOLS = [
         "season, things to watch out for. Use it to give concrete advice and tips (cite it, do not invent).",
         {"destination_id": {"type": "string", "description": "id from explore_destinations."}, "city": _CITY}),
     _fn("search_places",
-        "Find real catalogue places near a trip activity, a trip day, or a city; results stay inside that "
-        "destination's own area. The catalogue matches place NAMES word by word, so: put the KIND in `types` "
+        "Find real places near a trip activity, a trip day, or a city; results stay inside that destination's own "
+        "area. The catalogue matches place NAMES word by word, so: put the KIND in `types` "
         "(e.g. CAFE, BAR, ENTERTAINMENT for board games/karaoke, MUSEUM), and use `query` only for 1-3 words likely "
         "in a name or menu (a dish like 'bún chả', a brand, a place name). Leave out words like 'quán', 'ngon', "
         "'gần', 'để gặp bạn mới'. Rows carry rating, reviews, trips and checkins by app travellers, price, tags, "
         "menu, `hours` for the day asked (`hoursOn`) and distance: enough to recommend without further calls. "
         "Rows the tool added to fill the list, whose names do not contain the asked words, are marked "
-        "`nameMatch: false`. The tool also relaxes the search itself and reports what it relaxed.",
-        {"query": {"type": "string", "description": "Name words only, e.g. 'bún chả cá', 'Cộng', 'rooftop'. Omit when the kind is enough."},
+        "`nameMatch: false`. When fewer than three catalogue places carry the `query` words, the tool also looks "
+        "the query up on the map and appends what it finds as rows with `source: \"map\"` (ids starting 'map:'; "
+        "name, address and distance only). The tool also relaxes the search itself and reports what it relaxed. "
+        "Planning a trip needs several kinds at once (the stay, sights, breakfast, dinner): give them as `searches` in ONE call; "
+        "the other arguments (city, day) apply to every entry.",
+        {"searches": {"type": "array", "maxItems": 6,
+                      "description": "Several searches in one call, each with its own query/types/kind/sort/limit "
+                                     "(and optionally city/day/activity_id). Results come back per entry.",
+                      "items": {"type": "object", "properties": {
+                          "query": {"type": "string"},
+                          "types": {"type": "array", "items": {"type": "string", "enum": PLACE_TYPES}, "maxItems": 4},
+                          "kind": {"type": "string", "enum": ["food", "sight", "stay", "any"]},
+                          "city": {"type": "string"}, "day": {"type": "integer"},
+                          "activity_id": {"type": "string"},
+                          "sort": {"type": "string", "enum": ["popular", "rating"]},
+                          "limit": {"type": "integer", "minimum": 1, "maximum": 8}}}},
+         "query":{"type": "string", "description": "Name words only, e.g. 'bún chả cá', 'Cộng', 'rooftop', or a "
+                                                   "venue's name as the user gave it ('lẩu bò Ban Công'). Omit when "
+                                                   "the kind is enough."},
          "types": {"type": "array", "items": {"type": "string", "enum": PLACE_TYPES}, "maxItems": 4},
          "kind": {"type": "string", "enum": ["food", "sight", "stay", "any"],
                   "description": "stay = hotels, homestays, resorts (they have no types)."},
@@ -146,11 +163,12 @@ DIRECT_TOOLS = [t for t in DIRECT_TOOLS if t["function"]["name"] not in _NEEDS_T
 
 WEB_SEARCH = _fn(
     "web_search",
-    "Search the internet, at most once per answer. Use it (1) to find real places when search_places came back "
-    "thin for the ask (few rows, rows that do not fit, a part of the ask no row covers, or coverage thin): query "
-    "exactly what is missing plus the area and the city; (2) for local facts you are not sure of (is there a "
-    "morning market on this beach, does the ferry still run) and facts that must be current (an event date, "
-    "whether a venue still exists, news). Not for what you already know well. Results are unverified web snippets: name the places in the answer with the source link; never "
+    "Search the internet, at most once per answer, for facts: opening hours, prices, whether a venue still serves "
+    "the dish or still exists, event dates, news, local facts you are not sure of (is there a morning market on "
+    "this beach, does the ferry still run). Also for what search_places could not find: a kind the map cannot name, "
+    "or the part of the ask its rows miss (few rows that fit, coverage thin): query exactly that plus the area and "
+    "the city. A venue by name is found with search_places, which also looks on the map. Not for what you already "
+    "know well. Results are unverified web snippets: name what they say in the answer with the source link; never "
     "turn them into place cards or proposals.",
     {"query": {"type": "string", "description": "A short web query in the user's language, with the city."}},
     ["query"])
@@ -191,7 +209,12 @@ def step_for(name: str, args: dict, names: dict[str, str]) -> tuple[str, dict]:
     `names` maps ids already seen in this turn (activities, places, trips) to their names, so
     the step says "Hotel Mường Thanh" rather than an id."""
     params: dict[str, Any] = {}
-    if args.get("query"):
+    if isinstance(args.get("searches"), list):
+        asked = [str(s.get("query") or ", ".join(str(t).lower() for t in s.get("types") or []) or s.get("kind") or "")
+                 for s in args["searches"] if isinstance(s, dict)]
+        if any(asked):
+            params["query"] = ", ".join(a for a in asked if a)[:60]
+    elif args.get("query"):
         params["query"] = str(args["query"])[:60]
     elif args.get("types"):
         params["query"] = ", ".join(str(t).lower() for t in args["types"])[:60]
@@ -221,17 +244,45 @@ def step_for(name: str, args: dict, names: dict[str, str]) -> tuple[str, dict]:
     return STEP_KEYS.get(name, "thought"), params
 
 
-def collect_names(result: Any, names: dict[str, str], ids: dict[str, set[str]]) -> None:
+def map_search_step(searches: list[dict], results: list[Any]) -> dict | None:
+    """Params of the `map_search` step after a search_places call (one per batch, like its search
+    step): the asked names and how many places the map added. Java reports
+    `map: {provider, found}` whenever it looked; None when the map added nothing."""
+    asked: list[str] = []
+    found = 0
+    for search, result in zip(searches, results):
+        info = result.get("map") if isinstance(result, dict) else None
+        count = info.get("found") if isinstance(info, dict) else None
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            found += count
+            if str(search.get("query") or "").strip():
+                asked.append(str(search["query"]).strip())
+    return {"query": ", ".join(asked)[:60], "found": found} if found else None
+
+
+# A map row's id: "map:" + provider + ":" + the provider's place id.
+MAP_PREFIX = "map:"
+
+
+def collect_names(result: Any, names: dict[str, str], ids: dict[str, set[str]],
+                  map_rows: dict[str, dict] | None = None) -> None:
     """Remember ids → names from a tool result; ids of places, events, meetups, trips, check-ins
     and dishes become eligible for cards and buttons (`ids` is keyed by kind). A `placeId` on any
-    row (an activity, a check-in) is a real catalogue place too."""
+    row (an activity, a check-in) is a real catalogue place too. Map rows of search_places
+    (`map:` ids) go to `map_rows` whole: the reply rebuilds each map place from its row."""
     if isinstance(result, list):
         for item in result:
-            collect_names(item, names, ids)
+            collect_names(item, names, ids, map_rows)
         return
     if not isinstance(result, dict):
         return
     ident, label = result.get("id"), result.get("name") or result.get("title")
+    if isinstance(ident, str) and ident.startswith(MAP_PREFIX):
+        if label:
+            names[ident] = str(label)
+        if map_rows is not None:
+            map_rows[ident] = result
+        return
     if ident and label:
         names[str(ident)] = str(label)
         kind = result.get("kind")
@@ -248,4 +299,4 @@ def collect_names(result: Any, names: dict[str, str], ids: dict[str, set[str]]) 
         ids["place"].add(str(result["placeId"]))
     for value in result.values():
         if isinstance(value, (dict, list)):
-            collect_names(value, names, ids)
+            collect_names(value, names, ids, map_rows)

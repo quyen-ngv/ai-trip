@@ -12,14 +12,19 @@ is sent back once to either call the tool or answer properly.
 of an earlier call is answered with a note instead of running again, an unknown tool name costs
 nothing, and `get_place_details` / `travel_time` take a list so one model round fetches what
 used to take six (the model asked for one place or one hop per round).
+
+2026-10-28: search_places may return map rows (`map:` ids, `source: "map"`) for names the catalogue
+lacks. The model only ever writes such an id; the reply rebuilds each map place (card, proposal,
+plan stop) from the row this turn's tool returned, so a coordinate the model wrote never reaches
+Java. A map: id this turn did not return is dropped.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import math
 import re
-import unicodedata
 from collections import Counter
 from typing import Any, TypedDict
 
@@ -29,8 +34,8 @@ from .. import ai_log
 from . import images, read_url, web_search
 from .chat_model import ChatModel
 from .gateway import JavaGateway, TurnClosed
-from .prompts import SYSTEM, history_messages, question_message
-from .tools import collect_names, step_for, tools_for
+from .prompts import SYSTEM, fold, history_messages, question_message
+from .tools import MAP_PREFIX, collect_names, map_search_step, step_for, tools_for
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +44,9 @@ TURN_TIMEOUT_SECONDS = 120
 MAX_TOOL_RESULT_CHARS = 6000
 # The whole destination catalogue with its guide text is read in one go; cutting it would hide
 # destinations from the model.
-TOOL_RESULT_CHARS = {"explore_destinations": 40000, "read_url": 7000}
+TOOL_RESULT_CHARS = {"explore_destinations": 40000, "read_url": 7000,
+                     # A trip plan looks up the stay, the sights and food in one call (`searches`).
+                     "search_places": 16000}
 MAX_WEB_SEARCHES = 1
 # Pages read per answer: a list article found by the search, or a link the user sent.
 MAX_PAGE_READS = 2
@@ -53,27 +60,42 @@ MAX_DESTINATIONS = 4
 CARD_POOLS = {"TRIP": ("public_trip", "trip"), "EVENT": ("event",), "MEETUP": ("meetup",),
               "CHECKIN": ("checkin",), "FOOD": ("dish",)}
 MAX_MEMORY_CHARS = 1500
+# A thread's title and what Pengoo keeps about the user across 1:1 chats (Java splits the profile
+# into at most 12 lines of 80 characters).
+MAX_TITLE_CHARS = 80
+MAX_PROFILE_CHARS = 1000
+# A map place (`mapPlace`, MapPlaceRef in Java) as Java accepts it.
+MAP_PROVIDERS = ("GOONG", "MAPBOX")
+MAP_PLACE_ID_CHARS = 255
+MAP_NAME_CHARS = 200
+MAP_ADDRESS_CHARS = 300
+# The proposals that may take a map place instead of a catalogue one.
+MAP_PLACE_ACTIONS = ("ADD", "REPLACE")
 # Uses of one tool in one answer (items for the batch tools). Past the limit the call is refused
 # with a short note and does not count toward the budget: the log showed get_weather asked for a
 # price question and get_place_community for nine search rows one after another.
 TOOL_LIMITS = {"get_weather": 1, "get_place_community": 2, "get_place_details": 8, "travel_time": 12,
-               "search_places": 4, "explore_destinations": 1, "get_destination_guide": 2, "get_local_dishes": 1,
+               "search_places": 8, "explore_destinations": 1, "get_destination_guide": 2, "get_local_dishes": 1,
                "search_events": 2, "search_meetups": 1, "search_public_trips": 2, "get_budget": 1,
                "get_trip_checkins": 1, "rank_trip_places": 1, "list_my_trips": 1, "get_trip": 2}
 TOOL_LIMIT_DEFAULT = 3
 # Batch tools: (list argument, per-item argument built from it, cap). One model round, the Java
 # calls run at once, one tool call against the budget.
-BATCHES = {"get_place_details": ("place_ids", "place_id", 6), "travel_time": ("legs", None, 10)}
+BATCHES = {"get_place_details": ("place_ids", "place_id", 6), "travel_time": ("legs", None, 10),
+           "search_places": ("searches", None, 6)}
+# What one entry of search_places' `searches` may set; the call's own arguments are shared by all.
+_SEARCH_KEYS = ("query", "types", "kind", "activity_id", "day", "city", "sort", "radius_km", "limit")
 REPEATED_CALL = "Same call already answered above in this conversation: use that result."
 NUDGE = ("Your last message was neither a tool call nor the final JSON, so the user would see nothing useful. "
          "If you meant to check something, call that tool now. Otherwise reply with the final JSON answer.")
 # A short plain-text round, or one that says what Pengoo is about to do, is an announcement and
 # gets the nudge. A longer plain-text round that reads as an answer is the answer: sending it back
-# only made the model repeat it as JSON (one more model round, and the text showed twice).
+# only made the model repeat it as JSON (one more model round, and the text showed twice). A
+# trailing "nhé/nha" no longer counts: ordinary Vietnamese answers end with it.
 ANNOUNCEMENT_MAX_CHARS = 160
 _ANNOUNCEMENT = re.compile(
-    r"^\W*(để mình|mình (sẽ|xem|tìm|kiểm tra|tra)|đợi mình|chờ mình|let me|i'll|i will|i am going to|i'm going to|one moment|hold on)\b"
-    r"|\b(nhé|nha|nhá)\W*$", re.I)
+    r"^\W*(để mình|mình (sẽ|xem|tìm|kiểm tra|tra)|đợi mình|chờ mình|let me|i'll|i will|i am going to|i'm going to|one moment|hold on)\b",
+    re.I)
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.S)
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
 # The history annotation (prompts.history_messages) that a model sometimes copies into its answer.
@@ -83,8 +105,19 @@ _TIME = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 PROPOSAL_ACTIONS = ("ADD", "MOVE", "UPDATE_TIME", "REMOVE", "REPLACE",
                     "ADD_DAYS", "PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES",
                     "EDIT_TRIP", "EDIT_ACTIVITY", "NEW_ACTIVITY", "ADD_EXPENSE", "EDIT_EXPENSE",
-                    "REMOVE_EXPENSE", "ADD_NOTE", "ADD_GUEST")
+                    "REMOVE_EXPENSE", "ADD_NOTE", "ADD_GUEST", "NEW_TRIP", "PLAN_DAYS")
 MAX_PROPOSALS = 10
+# A planned trip (NEW_TRIP) or the days of one (PLAN_DAYS); Java checks every value again.
+PLAN_ACTIONS = ("NEW_TRIP", "PLAN_DAYS")
+MAX_PLAN_DAYS = 30
+MAX_PLAN_ITEMS = 14
+_PLAN_TEXT = {"name": 255, "destination": 120, "description": 2000, "currency": 8,
+              "startingPointName": 255, "startingPointAddress": 500}
+_ITEM_TEXT = {"placeId": 64, "name": 255, "category": 40, "notes": 2000, "description": 2000, "address": 500,
+              "endAddress": 500, "transportMode": 16, "costCurrency": 8}
+# Questions asked before planning, each with tap answers.
+MAX_QUESTIONS = 3
+MAX_QUESTION_OPTIONS = 6
 # The field names each trip-information action may set; Java checks every value again.
 _CHANGE_FIELDS = {
     "EDIT_TRIP": ("name", "description", "budget", "currency", "visibility",
@@ -118,7 +151,8 @@ class State(TypedDict, total=False):
 
 
 # Any of these makes a JSON object the reply's final format rather than data quoted in prose.
-_OUTPUT_KEYS = {"answer", "places", "proposals", "destinations", "cards", "actions", "suggestions", "memory"}
+_OUTPUT_KEYS = {"answer", "places", "proposals", "destinations", "cards", "actions", "suggestions", "memory",
+                "questions"}
 _TRAILING_FENCE = re.compile(r"```(?:json)?\s*$")
 
 
@@ -177,18 +211,12 @@ _GENERIC_NAME_WORDS = {
     "bar", "pub", "shop", "store", "market", "cho", "park", "cong", "vien", "temple", "chua", "den", "museum",
     "bao", "tang", "hotel", "homestay", "khach", "san", "resort", "beach", "bien", "bai", "street", "pho",
 }
-_NAME_TOKEN = re.compile(r"[a-z0-9]+")
-
-
-def _fold(text: str) -> str:
-    text = unicodedata.normalize("NFD", (text or "").lower().replace("đ", "d"))
-    return " ".join(_NAME_TOKEN.findall("".join(c for c in text if unicodedata.category(c) != "Mn")))
 
 
 def _distinctive(name: str) -> str | None:
     """The part of a place name that identifies it, accent-free: "Trúc Bạch Lake" -> "truc bach".
     None when what is left is too short to tell one place from another."""
-    tokens = _fold(name).split()
+    tokens = fold(name).split()
     while tokens and tokens[0] in _GENERIC_NAME_WORDS:
         tokens.pop(0)
     while tokens and tokens[-1] in _GENERIC_NAME_WORDS:
@@ -199,8 +227,8 @@ def _distinctive(name: str) -> str | None:
 
 
 def mentioned_places(answer: str, candidates: dict[str, str]) -> list[str]:
-    """Ids of catalogue places (id -> name) that the answer names, in the order they appear."""
-    text = f" {_fold(answer)} "
+    """Ids of places (id -> name) that the answer names, in the order they appear."""
+    text = f" {fold(answer)} "
     found: list[tuple[int, str]] = []
     for place_id, name in candidates.items():
         key = _distinctive(name)
@@ -212,11 +240,12 @@ def mentioned_places(answer: str, candidates: dict[str, str]) -> list[str]:
 
 
 def attach_mentioned_places(final: dict, candidates: dict[str, str], limit: int = 6) -> dict:
-    """Cards for catalogue places the answer names but the model left out of "places".
+    """Cards for places the answer names but the model left out of "places".
 
     The model sometimes answers in plain text (or JSON without "places") right after a search, so
-    a catalogue place it recommends by name shows no card. Only places returned by this turn's
-    tools are candidates: they are real and public, and Java checks them again."""
+    a place it recommends by name shows no card. Only places returned by this turn's tools are
+    candidates (catalogue rows and map rows, which clean_reply turns into map places): they are
+    real, and Java checks them again."""
     places = [p for p in (final.get("places") or []) if isinstance(p, dict)]
     have = {str(p.get("placeId") or p.get("id") or "") for p in places}
     for place_id in mentioned_places(str(final.get("answer") or ""), candidates):
@@ -338,18 +367,185 @@ def clean_changes(action: str, raw) -> dict:
     return out
 
 
+def _hhmm(value: Any) -> str | None:
+    """'6:30' or '06:30' as '06:30'; None when it is not a time of day."""
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(value or ""))
+    if not match:
+        return None
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    return f"{hours:02d}:{minutes:02d}" if hours < 24 and minutes < 60 else None
+
+
+def _bounded_int(value: Any, low: int, high: int) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if low <= number <= high else None
+
+
+def _money(value: Any) -> str | None:
+    """A price as text for Java to parse: plain numbers stay plain, '3.605.000' is left as written."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(int(value)) if float(value).is_integer() else str(value)
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:32]
+    return None
+
+
+def _texts(source: dict, limits: dict[str, int]) -> dict:
+    return {key: str(source[key]).strip()[:limit] for key, limit in limits.items()
+            if isinstance(source.get(key), (str, int, float)) and not isinstance(source.get(key), bool)
+            and str(source[key]).strip()}
+
+
+def _coordinate(value: Any, bound: float) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) and -bound <= number <= bound else None
+
+
+def map_place(row: Any) -> dict | None:
+    """The `mapPlace` of a map row search_places returned (id "map:<PROVIDER>:<place id>"), inside
+    the bounds Java accepts, or None when the row cannot make one. Java rejects the whole reply
+    over one bad value, so a row that does not fit is left out rather than sent."""
+    if not isinstance(row, dict):
+        return None
+    prefix, provider, place_id = (str(row.get("id") or "").split(":", 2) + ["", ""])[:3]
+    name = str(row.get("name") or "").strip()[:MAP_NAME_CHARS]
+    lat, lng = _coordinate(row.get("lat"), 90), _coordinate(row.get("lng"), 180)
+    if (prefix + ":" != MAP_PREFIX or provider not in MAP_PROVIDERS or not place_id
+            or len(place_id) > MAP_PLACE_ID_CHARS or not name or lat is None or lng is None):
+        return None
+    ref: dict[str, Any] = {"provider": provider, "providerPlaceId": place_id, "name": name}
+    address = str(row.get("address") or "").strip()[:MAP_ADDRESS_CHARS]
+    if address:
+        ref["address"] = address
+    ref["lat"], ref["lng"] = lat, lng
+    return ref
+
+
+def _map_ref(map_rows: dict[str, dict] | None, place_id: Any) -> dict | None:
+    return map_place((map_rows or {}).get(str(place_id or "").strip()))
+
+
+def clean_plan(raw: Any, map_rows: dict[str, dict] | None = None) -> dict | None:
+    """The plan of a NEW_TRIP / PLAN_DAYS proposal, bounded to what Java accepts; None when no day
+    has a stop with a name or a place. A stop on a map row of this turn (`map:` placeId) carries
+    the row's position and provider id instead of a placeId."""
+    if not isinstance(raw, dict):
+        return None
+    plan = _texts(raw, _PLAN_TEXT)
+    start = str(raw.get("startDate") or "")
+    if _DATE.fullmatch(start):
+        plan["startDate"] = start
+    count = _bounded_int(raw.get("dayCount"), 1, MAX_PLAN_DAYS)
+    if count:
+        plan["dayCount"] = count
+    budget = _money(raw.get("budget"))
+    if budget:
+        plan["budget"] = budget
+    departure = _hhmm(raw.get("departureTime"))
+    if departure:
+        plan["departureTime"] = departure
+    days: list[dict] = []
+    for day in raw.get("days") or []:
+        if not isinstance(day, dict) or len(days) >= MAX_PLAN_DAYS:
+            continue
+        number = _bounded_int(day.get("dayNumber"), 1, 400)
+        if number is None:
+            continue
+        items: list[dict] = []
+        for item in day.get("items") or []:
+            if not isinstance(item, dict) or len(items) >= MAX_PLAN_ITEMS:
+                continue
+            row = _texts(item, _ITEM_TEXT)
+            # Read from the item, not the row: a provider id is longer than a placeId may be.
+            place_ref = str(item.get("placeId") or "").strip()
+            if place_ref.startswith(MAP_PREFIX):
+                row.pop("placeId", None)
+                ref = _map_ref(map_rows, place_ref)
+                if ref:
+                    row.setdefault("name", ref["name"])
+                    if ref.get("address"):
+                        row.setdefault("address", ref["address"])
+                    row.update(lat=ref["lat"], lng=ref["lng"], mapProvider=ref["provider"],
+                               mapPlaceId=ref["providerPlaceId"])
+            if not row.get("name") and not row.get("placeId"):
+                continue
+            for key in ("startTime", "endTime"):
+                at = _hhmm(item.get(key))
+                if at:
+                    row[key] = at
+            cost = _money(item.get("cost"))
+            if cost:
+                row["cost"] = cost
+            if "transportMode" in row:
+                row["transportMode"] = row["transportMode"].upper()
+            if item.get("stay") is True:
+                row["stay"] = True
+                until = _bounded_int(item.get("untilDay"), 1, 400)
+                if until:
+                    row["untilDay"] = until
+            items.append(row)
+        if items:
+            entry: dict[str, Any] = {"dayNumber": number, "items": items}
+            title = str(day.get("title") or "").strip()[:120]
+            if title:
+                entry["title"] = title
+            days.append(entry)
+    if not days:
+        return None
+    plan["days"] = days
+    return plan
+
+
+def clean_questions(raw: Any) -> list[dict]:
+    """Questions with tap answers: a question needs two options to be worth tapping."""
+    out: list[dict] = []
+    for item in raw or []:
+        if not isinstance(item, dict) or len(out) >= MAX_QUESTIONS:
+            continue
+        text = str(item.get("text") or item.get("question") or "").strip()[:200]
+        options = [str(option).strip()[:80] for option in item.get("options") or []
+                   if isinstance(option, (str, int, float)) and not isinstance(option, bool) and str(option).strip()]
+        options = list(dict.fromkeys(options))[:MAX_QUESTION_OPTIONS]
+        if text and len(options) >= 2:
+            question: dict[str, Any] = {"text": text, "options": options}
+            if item.get("multiple") is True:
+                question["multiple"] = True
+            out.append(question)
+    return out
+
+
 def clean_reply(final: dict, allowed_places: set[str], usage: dict,
-                ids: dict[str, set[str]] | None = None) -> dict:
+                ids: dict[str, set[str]] | None = None, map_rows: dict[str, dict] | None = None) -> dict:
     """What Java receives: bounded lists, places only from this turn's tool results, earlier
-    cards or the trip; buttons only for ids seen in this turn."""
+    cards or the trip; buttons only for ids seen in this turn. A `map:` id becomes a `mapPlace`
+    rebuilt from this turn's map row (`map_rows`), in a card, an ADD/REPLACE or a plan stop."""
     places, seen = [], set()
     for item in final.get("places") or []:
         if not isinstance(item, dict):
             continue
-        place_id = str(item.get("placeId") or item.get("id") or "")
-        if place_id in allowed_places and place_id not in seen:
+        place_id = str(item.get("placeId") or item.get("id") or "").strip()
+        if place_id in seen:
+            continue
+        note = str(item.get("note") or "").strip()[:300] or None
+        if place_id.startswith(MAP_PREFIX):
+            ref = _map_ref(map_rows, place_id)
+            if ref:
+                seen.add(place_id)
+                places.append({"mapPlace": ref, "note": note})
+        elif place_id in allowed_places:
             seen.add(place_id)
-            note = str(item.get("note") or "").strip()[:300] or None
             places.append({"placeId": place_id, "note": note})
     proposals = []
     for item in final.get("proposals") or []:
@@ -358,9 +554,18 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
                                                        "startDate", "startTime", "endTime", "placeId", "activityId",
                                                        "expenseId", "category", "summary")
                         if item.get(key) not in (None, "")}
+            if str(proposal.get("placeId") or "").strip().startswith(MAP_PREFIX):
+                ref = _map_ref(map_rows, proposal.pop("placeId"))
+                if ref and item["action"] in MAP_PLACE_ACTIONS:
+                    proposal["mapPlace"] = ref
             changes = clean_changes(item.get("action"), item.get("changes"))
             if changes:
                 proposal["changes"] = changes
+            if item.get("action") in PLAN_ACTIONS:
+                plan = clean_plan(item.get("plan"), map_rows)
+                if plan is None:
+                    continue
+                proposal["plan"] = plan
             for key in ("startTime", "endTime"):
                 if key in proposal and not _TIME.fullmatch(str(proposal[key])):
                     proposal.pop(key)
@@ -383,10 +588,16 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
              "actions": clean_actions(final.get("actions"), ids or {}),
              "cards": clean_cards(final.get("cards"), ids or {}),
              "destinations": clean_destinations(final.get("destinations"), ids or {}),
+             "questions": clean_questions(final.get("questions")),
              "inputTokens": usage.get("input", 0), "outputTokens": usage.get("output", 0)}
     memory = final.get("memory")
     if isinstance(memory, str) and memory.strip():
         reply["memory"] = memory.strip()[:MAX_MEMORY_CHARS]
+    # Java keeps a title only for a 1:1 thread that has none, and a profile only from a 1:1 chat.
+    for key, limit in (("title", MAX_TITLE_CHARS), ("profile", MAX_PROFILE_CHARS)):
+        value = final.get(key)
+        if isinstance(value, str) and value.strip():
+            reply[key] = value.strip()[:limit]
     return reply
 
 
@@ -397,7 +608,8 @@ NEAR_STOP_KM = 1.5
 # PlaceSubType.Family.FOOD in Java; every other type is a sight (markets, beaches, viewpoints…).
 FOOD_TYPES = {"RESTAURANT", "STREET_FOOD", "CAFE", "TEA", "BAR", "BAKERY", "DESSERT", "SEAFOOD", "VEGETARIAN",
               "VEGAN", "HALAL"}
-THIN_CATALOGUE_NOTE = ("The app's map has little for this ask (it is not a full map of Vietnam): {reasons}. Call "
+# Not "the app's map": map rows (`source: "map"`) are a different source the model must tell apart.
+THIN_CATALOGUE_NOTE = ("The app's catalogue has little for this ask: {reasons}. Call "
                        "web_search now for what the user asked (the kind, dish or fact plus the area and the city, "
                        "in the user's language), then answer with the best of both: rows here that truly fit as "
                        "place cards, web finds named in the text with their source link. Leave out rows that do "
@@ -413,20 +625,21 @@ def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -
 
     Thin when any of these holds: the radius had to be widened; fewer than three rows match the
     asked name words (the tool pads a short list with same-kind places whose names do not contain
-    them); fewer than three rows at all; an asked type has no row (asked SEAFOOD and MARKET, got
-    only seafood restaurants: the market part is unanswered); the search was around a stop of the
+    them; a map row counts, the map found it by those words); fewer than three rows at all; an
+    asked type has no row (asked SEAFOOD and MARKET, got only seafood restaurants: the market part
+    is unanswered); the search was around a stop of the
     trip and fewer than three rows are within walking distance of it. Only while a web search is
     still available; otherwise the result is left as it came."""
     if not web_left or not isinstance(result, dict) or not isinstance(result.get("places"), list):
         return result
     rows = [row for row in result["places"] if isinstance(row, dict)]
     searched = result.get("searched") or {}
-    words = _fold(str(searched.get("nameWords") or "")).split()
+    words = fold(str(searched.get("nameWords") or "")).split()
     reasons: list[str] = []
     if any("radius" in str(step) for step in result.get("relaxed") or []):
         reasons.append("the search had to be widened")
-    matching = [row for row in rows if row.get("nameMatch") is not False
-                and set(words) <= set(_fold(str(row.get("name") or "")).split())]
+    matching = [row for row in rows if row.get("source") == "map" or (
+                row.get("nameMatch") is not False and set(words) <= set(fold(str(row.get("name") or "")).split()))]
     if len(matching) < THIN_CATALOGUE_ROWS:
         reasons.append(f"only {len(matching)} place(s) match '{searched.get('nameWords')}'" if words
                        else f"only {len(matching)} place(s) found")
@@ -448,16 +661,23 @@ def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -
     return {**result, "coverage": "thin", "note": THIN_CATALOGUE_NOTE.format(reasons="; ".join(reasons))}
 
 
+def web_offered(turn: dict) -> bool:
+    """Whether this turn may reach the internet (web_search and read_url)."""
+    return bool((turn.get("limits") or {}).get("webSearch")) and web_search.configured()
+
+
 def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     limits = turn.get("limits") or {}
     max_tool_calls = int(limits.get("maxToolCalls") or 6)
     max_output = int(limits.get("maxOutputTokens") or 1800)
-    web_allowed = bool(limits.get("webSearch")) and web_search.configured()
+    web_allowed = web_offered(turn)
     tools = tools_for(str(turn.get("conversationType") or "TRIP"), web_search=web_allowed)
     # One provider cache per tool list: the trip chat and the 1:1 chat send different tools, and a
     # changed tool list is a different prefix.
-    cache_key = f"pengoo-v3-{str(turn.get('conversationType') or 'TRIP').lower()}{'-web' if web_allowed else ''}"
+    cache_key = f"pengoo-v4-{str(turn.get('conversationType') or 'TRIP').lower()}{'-web' if web_allowed else ''}"
     names: dict[str, str] = {}
+    # Map rows by their `map:` id: the map cards of earlier answers, then what search_places returns now.
+    map_rows: dict[str, dict] = {}
     ids: dict[str, set[str]] = {"place": set(), "event": set(), "meetup": set(), "trip": set(),
                                 "public_trip": set(), "checkin": set(), "dish": set(), "destination": set()}
     allowed_places = ids["place"]
@@ -467,6 +687,13 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                 allowed_places.add(str(place["id"]))
                 if place.get("name"):
                     names[str(place["id"])] = str(place["name"])
+        # Map cards of earlier answers come whole (Java has no row to look them up by), so "add the
+        # second one to day 2" can still become a proposal.
+        for place in row.get("mapPlaces") or []:
+            if isinstance(place, dict) and map_place(place):
+                map_rows[str(place["id"])] = place
+    # Cards already shown are not attached again just because the answer names them.
+    shown_map_ids = set(map_rows)
     trip = turn.get("trip") or {}
     for day in trip.get("days") or []:
         for activity in day.get("activities") or []:
@@ -552,9 +779,15 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         key = call_key(name, args)
         if key not in answered:
             result = await java.tool(name, args)
-            collect_names(result, names, ids)
+            collect_names(result, names, ids, map_rows)
             answered[key] = result
         return answered[key]
+
+    async def post_map_step(searches: list[dict], results: list[Any]) -> None:
+        """'Found on the map' in the thinking view, after a search the map added places to."""
+        params = map_search_step(searches, results)
+        if params:
+            await java.step("map_search", params)
 
     async def run_tools(state: State) -> State:
         last = state["messages"][-1]
@@ -615,7 +848,17 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
                     result = await read_url.read(str(args.get("url") or ""))
             elif name in BATCHES and BATCHES[name][0] in args:
                 rows = await asyncio.gather(*(java_once(name, item) for item in items))
-                if name == "travel_time":
+                if name == "search_places":
+                    await post_map_step(items, rows)
+                    # Each entry is judged on its own (prod 2026-10-28: a batch result was never
+                    # flagged, so a thin "lẩu bò Ban Công" search got no web search at all).
+                    web_left = web_allowed and searched < MAX_WEB_SEARCHES
+                    rows = [flag_thin_catalogue(row, web_left, item) for item, row in zip(items, rows)]
+                    thin = thin or any(isinstance(row, dict) and row.get("coverage") == "thin" for row in rows)
+                    result = {"searches": [{"asked": {k: v for k, v in item.items() if k in _SEARCH_KEYS},
+                                            **(row if isinstance(row, dict) else {"result": row})}
+                                           for item, row in zip(items, rows)]}
+                elif name == "travel_time":
                     result = {"legs": [{**item, **(row if isinstance(row, dict) else {"result": row})}
                                        for item, row in zip(items, rows)]}
                 else:
@@ -623,6 +866,7 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
             else:
                 result = await java_once(name, items[0])
                 if name == "search_places":
+                    await post_map_step(items, [result])
                     result = flag_thin_catalogue(result, web_allowed and searched < MAX_WEB_SEARCHES, args)
                     thin = thin or (isinstance(result, dict) and result.get("coverage") == "thin")
             uses[name] += len(items)
@@ -635,8 +879,10 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
     async def finish(state: State) -> State:
         await java.step("writing_answer", {})
         found = {pid: names[pid] for pid in allowed_places - known_places if pid in names}
+        found.update({map_id: str(row.get("name") or "") for map_id, row in map_rows.items()
+                      if map_id not in shown_map_ids and map_place(row)})
         final = attach_mentioned_places(state.get("final") or {}, found)
-        reply = clean_reply(final, allowed_places, state.get("usage") or {}, ids)
+        reply = clean_reply(final, allowed_places, state.get("usage") or {}, ids, map_rows)
         if state.get("stop_reason"):
             reply["stopReason"] = state["stop_reason"]
         await java.reply(reply)
@@ -678,6 +924,13 @@ def batch_items(name: str, args: dict) -> list[dict]:
     if name not in BATCHES:
         return [args]
     list_key, item_key, cap = BATCHES[name]
+    if name == "search_places":
+        searches = [entry for entry in args.get(list_key) or [] if isinstance(entry, dict)]
+        if not searches:
+            return [args]
+        shared = {key: value for key, value in args.items() if key in _SEARCH_KEYS}
+        return [{**shared, **{key: value for key, value in entry.items() if key in _SEARCH_KEYS}}
+                for entry in searches[:cap]]
     if name == "travel_time":
         legs = [leg for leg in args.get(list_key) or [] if isinstance(leg, dict) and leg.get("from") and leg.get("to")]
         if legs:
@@ -689,11 +942,12 @@ def batch_items(name: str, args: dict) -> list[dict]:
     return [{item_key: value} for value in dict.fromkeys(ids[:cap])]
 
 
-def initial_messages(turn: dict, photos: list[str] | None = None) -> list[dict]:
+def initial_messages(turn: dict, photos: list[str] | None = None, web: bool = False) -> list[dict]:
     """The static rules, the chat so far, then one user message with the per-turn context and the
     question: everything before the last message is a stable prefix for the provider cache.
-    Photos sent with the question go in that last message, before its text."""
-    question: Any = question_message(turn, len(photos or []))
+    Photos sent with the question go in that last message, before its text. `web`: web search is
+    offered in this turn (the context then says when the user asked for it)."""
+    question: Any = question_message(turn, len(photos or []), web)
     if photos:
         question = [{"type": "image_url", "image_url": {"url": url}} for url in photos]             + [{"type": "text", "text": question}]
     return ([{"role": "system", "content": SYSTEM}] + history_messages(turn)
@@ -728,7 +982,8 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
         # Java sends how long it waits before failing the turn itself, minus a margin (a PRO budget
         # of 20 tool calls needs far longer than the old fixed 120 s).
         timeout = int(limits.get("timeoutSeconds") or TURN_TIMEOUT_SECONDS)
-        await asyncio.wait_for(graph.ainvoke({"messages": initial_messages(turn, photos), "tool_calls": 0},
+        messages = initial_messages(turn, photos, web_offered(turn))
+        await asyncio.wait_for(graph.ainvoke({"messages": messages, "tool_calls": 0},
                                              {"recursion_limit": limit}), timeout=timeout)
     except TurnClosed:
         logger.info("assistant turn %s closed by Java before the answer", turn.get("turnId"))

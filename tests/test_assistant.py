@@ -540,8 +540,9 @@ def test_long_plain_text_is_an_answer_but_an_announcement_is_not():
     long_answer = ("Vé thuyền Tràng An năm 2026 là **300.000đ/người lớn** (cao trên 1,3 m) và 150.000đ cho trẻ "
                    "em cao 1–1,3 m; trẻ dưới 1 m miễn phí. Giá có thể thay đổi, bạn kiểm tra lại trước khi đi.")
     assert not looks_like_announcement(long_answer)
-    assert looks_like_announcement(long_answer + " Để mình kiểm tra thêm giờ mở cửa nhé")
-    assert not looks_like_announcement("Phở Ngọc Béo mở 5:30–15:00.", acted=True)
+    # A Vietnamese answer that ends in "nhé" is still an answer.
+    assert not looks_like_announcement(long_answer + " Đi sớm cho đỡ đông nhé")
+    assert not looks_like_announcement("Phở Ngọc Béo mở 5:30–15:00, đi sớm nhé.", acted=True)
     assert looks_like_announcement("Mình xem thêm giờ mở cửa nhé.", acted=True)
 
 
@@ -808,3 +809,210 @@ async def test_running_out_of_credit_stops_with_what_was_written():
     reply = java.replies[0]
     assert reply["stopReason"] == "CREDIT_EXHAUSTED"
     assert reply["markdown"] == "Mình đang tìm quán bún chả cá gần khách sạn."
+
+
+def test_a_trip_plan_is_bounded_and_keeps_stops_with_a_name_or_place():
+    final = {"answer": "Plan Tà Xùa 2N1Đ", "proposals": [
+        {"action": "NEW_TRIP", "summary": "Tà Xùa 2N1Đ", "plan": {
+            "name": "Tà Xùa săn mây", "destination": "Tà Xùa", "dayCount": "2", "budget": 3605000,
+            "startDate": "next week", "departureTime": "6:30",
+            "days": [{"dayNumber": 1, "title": "Lên Tà Xùa", "items": [
+                {"name": "Limousine", "startTime": "6:30", "transportMode": "car", "cost": 300000},
+                {"placeId": PLACE, "name": "Cafe", "startTime": "25:00"},
+                {"notes": "no name, no place"}]},
+                {"dayNumber": "x", "items": [{"name": "dropped day"}]}]}},
+        {"action": "PLAN_DAYS", "plan": {"days": [{"dayNumber": 1, "items": []}]}}],
+        "questions": [{"text": "Đi mấy người?", "options": ["2 người", "2 người", "4 người"]},
+                      {"text": "Một lựa chọn", "options": ["chỉ một"]}]}
+
+    reply = clean_reply(final, {PLACE}, {})
+
+    assert [p["action"] for p in reply["proposals"]] == ["NEW_TRIP"]   # a plan with no stop is dropped
+    plan = reply["proposals"][0]["plan"]
+    assert plan["dayCount"] == 2 and plan["budget"] == "3605000" and plan["departureTime"] == "06:30"
+    assert "startDate" not in plan
+    assert len(plan["days"]) == 1
+    leg, cafe = plan["days"][0]["items"]
+    assert leg == {"name": "Limousine", "transportMode": "CAR", "startTime": "06:30", "cost": "300000"}
+    assert cafe["placeId"] == PLACE and "startTime" not in cafe
+    assert reply["questions"] == [{"text": "Đi mấy người?", "options": ["2 người", "4 người"]}]
+
+
+def test_several_searches_are_one_call_with_shared_arguments():
+    items = graph_module.batch_items("search_places", {"city": "Tà Xùa", "searches": [
+        {"kind": "stay"}, {"types": ["VIEWPOINT"], "sort": "popular", "bogus": 1}]})
+
+    assert items == [{"city": "Tà Xùa", "kind": "stay"},
+                     {"city": "Tà Xùa", "types": ["VIEWPOINT"], "sort": "popular"}]
+    assert graph_module.batch_items("search_places", {"query": "phở"}) == [{"query": "phở"}]
+
+
+MAP_ID = "map:GOONG:g-123"
+MAP_ROW = {"id": MAP_ID, "source": "map", "name": "Lẩu Bò Ban Công",
+           "address": "12 ngõ 87 Vũ Phạm Hàm, Cầu Giấy, Hà Nội", "distanceKm": 1.2, "lat": 21.0123, "lng": 105.8012}
+MAP_PLACE = {"provider": "GOONG", "providerPlaceId": "g-123", "name": "Lẩu Bò Ban Công",
+             "address": "12 ngõ 87 Vũ Phạm Hàm, Cầu Giấy, Hà Nội", "lat": 21.0123, "lng": 105.8012}
+
+
+def test_map_rows_become_map_places_in_cards_proposals_and_plans():
+    final = {"answer": "Lẩu bò Ban Công nè",
+             "places": [{"placeId": MAP_ID, "note": "Lẩu bò"}, {"placeId": "map:GOONG:made-up"}, {"placeId": PLACE},
+                        {"mapPlace": {**MAP_PLACE, "lat": 0}}],
+             "proposals": [
+                 {"action": "ADD", "placeId": MAP_ID, "dayNumber": 1, "lat": 0, "lng": 0},
+                 {"action": "REPLACE", "activityId": ACTIVITY, "placeId": "map:GOONG:made-up"},
+                 {"action": "MOVE", "activityId": ACTIVITY, "placeId": MAP_ID, "toDayNumber": 2},
+                 {"action": "NEW_TRIP", "plan": {"days": [{"dayNumber": 1, "items": [
+                     {"placeId": MAP_ID, "name": "Ăn tối lẩu bò", "lat": 1, "lng": 1, "mapPlaceId": "x"},
+                     {"placeId": "map:GOONG:made-up", "name": "Quán khác"},
+                     {"placeId": "map:GOONG:made-up"}]}]}}]}
+
+    reply = clean_reply(final, {PLACE}, {}, None, {MAP_ID: MAP_ROW})
+
+    # Rebuilt from the tool's row: coordinates the model wrote and map ids it made up never reach Java.
+    assert reply["places"] == [{"mapPlace": MAP_PLACE, "note": "Lẩu bò"}, {"placeId": PLACE, "note": None}]
+    add, replace, move, trip = reply["proposals"]
+    assert add == {"action": "ADD", "dayNumber": 1, "mapPlace": MAP_PLACE}
+    assert replace == {"action": "REPLACE", "activityId": ACTIVITY}
+    assert move == {"action": "MOVE", "activityId": ACTIVITY, "toDayNumber": 2}
+    dinner, other = trip["plan"]["days"][0]["items"]
+    assert dinner == {"name": "Ăn tối lẩu bò", "address": MAP_PLACE["address"], "lat": 21.0123, "lng": 105.8012,
+                      "mapProvider": "GOONG", "mapPlaceId": "g-123"}
+    assert other == {"name": "Quán khác"}
+
+
+@pytest.mark.asyncio
+async def test_a_map_find_shows_a_step_and_its_name_in_the_answer_becomes_a_map_card():
+    class MapJava(FakeJava):
+        async def tool(self, name, arguments):
+            self.tools.append((name, arguments))
+            return {"places": [MAP_ROW], "map": {"provider": "GOONG", "found": 1}}
+
+    java = MapJava()
+    answer = "**Lẩu Bò Ban Công** ở 12 ngõ 87 Vũ Phạm Hàm, Cầu Giấy."
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_places", {"query": "lẩu bò Ban Công"})]},
+                          {"content": answer})
+    await build_graph(TURN, java, model).ainvoke({"messages": initial_messages(TURN), "tool_calls": 0})
+
+    assert [s[0] for s in java.steps] == ["search_places", "map_search", "writing_answer"]
+    assert java.steps[1][1] == {"query": "lẩu bò Ban Công", "found": 1}
+    assert java.replies[0]["places"] == [{"mapPlace": MAP_PLACE, "note": None}]
+
+
+@pytest.mark.asyncio
+async def test_a_map_card_of_an_earlier_answer_can_be_added_but_is_not_shown_again():
+    turn = {**TURN, "history": [{"role": "assistant", "text": "Lẩu Bò Ban Công ở Vũ Phạm Hàm.",
+                                 "mapPlaces": [MAP_ROW]}]}
+    java = FakeJava()
+    final = ('{"answer": "Thêm Lẩu Bò Ban Công vào tối ngày 2 nhé.", "proposals": [{"action": "ADD", '
+             '"placeId": "' + MAP_ROW["id"] + '", "dayNumber": 2, "summary": "Thêm Lẩu Bò Ban Công"}]}')
+    await build_graph(turn, java, ScriptedModel({"content": final})).ainvoke(
+        {"messages": initial_messages(turn), "tool_calls": 0})
+
+    reply = java.replies[0]
+    assert reply["proposals"][0]["mapPlace"] == MAP_PLACE and "placeId" not in reply["proposals"][0]
+    assert not reply.get("places")
+
+
+def test_a_batch_posts_one_map_step_for_the_searches_the_map_added_to():
+    from app.assistant.tools import map_search_step
+    searches = [{"query": "homestay Hoa Ban"}, {"kind": "food"}, {"query": "lẩu bò Ban Công"}]
+    results = [{"map": {"provider": "GOONG", "found": 2}}, {"places": []}, {"map": {"provider": "GOONG", "found": 0}}]
+    assert map_search_step(searches, results) == {"query": "homestay Hoa Ban", "found": 2}
+    assert map_search_step(searches[1:], results[1:]) is None
+
+
+def test_map_rows_count_as_name_matches_for_the_thin_flag():
+    result = {"searched": {"nameWords": "lẩu bò ban công"}, "map": {"provider": "GOONG", "found": 2},
+              "places": [{"id": "c1", "name": "Lẩu bò Ban Công"},
+                         {"id": "map:GOONG:a", "source": "map", "name": "Ban Công Quán"},
+                         {"id": "map:GOONG:b", "source": "map", "name": "Lẩu bò Ban Công 2"}]}
+    assert "coverage" not in graph_module.flag_thin_catalogue(result, True)
+
+
+@pytest.mark.asyncio
+async def test_a_thin_batch_search_is_flagged_and_pushes_a_web_search():
+    # Prod 2026-10-28: a `searches` batch came back with one hot-pot place and the model answered
+    # without web_search, because only single searches were ever flagged thin.
+    class ThinJava(FakeJava):
+        async def tool(self, name, arguments):
+            self.tools.append((name, arguments))
+            return {"searched": {"nameWords": arguments.get("query")},
+                    "places": [{"id": "a2ef459f-63e9-4704-a238-8935ee168c03", "name": "King Sushi & Lẩu"}]}
+
+    java = ThinJava()
+    batch = {"searches": [{"query": "lẩu bò"}, {"query": "Ban Công"}]}
+    answer = '{"answer": "Mình chưa tìm thấy quán đó."}'
+    model = ScriptedModel({"content": "", "tool_calls": [tool_call("search_places", batch)]},
+                          {"content": answer}, {"content": answer})
+    turn = {**TURN, "limits": {**(TURN.get("limits") or {}), "webSearch": True}}
+    original = graph_module.web_search.configured
+    graph_module.web_search.configured = lambda: True
+    try:
+        await build_graph(turn, java, model).ainvoke({"messages": initial_messages(turn), "tool_calls": 0})
+    finally:
+        graph_module.web_search.configured = original
+
+    tool_result = next(m for m in model.calls[1]["messages"] if m.get("role") == "tool")
+    assert '"coverage": "thin"' in tool_result["content"]
+    assert any("web_search is still unused" in str(m.get("content")) for m in model.calls[2]["messages"])
+
+
+def test_a_short_question_takes_the_language_of_the_askers_earlier_messages():
+    from app.assistant.prompts import context_message, reply_language
+    # Prod 2026-10-28: "Search đi" from an app set to English, after Vietnamese questions.
+    turn = {"conversationType": "ASSISTANT", "locale": "en", "user": {"name": "An"}, "question": "Search đi",
+            "history": [{"role": "user", "name": "An", "text": "Quán lẩu bò Ban Công ở Cầu Giấy còn mở không?"},
+                        {"role": "assistant", "text": "I couldn't find it, do you remember another name?"}]}
+    assert "Reply in: Vietnamese." in context_message(turn)
+    # Another member's lines say nothing about the asker's language.
+    group = {**turn, "history": [{"role": "user", "name": "Bình", "text": "Quán lẩu bò ở Cầu Giấy còn mở không?"}]}
+    assert "Reply in: English." in context_message(group)
+    assert reply_language("Hội An?", "vi", ["What should we eat near the hotel tonight?"]) == "English"
+    assert reply_language("Ok", "vi", ["Where is the best pho near the hotel?"]) == "English"
+    assert reply_language("Ok", "vi") == "Vietnamese"
+
+
+def test_an_explicit_search_request_makes_web_search_required_when_offered():
+    from app.assistant.prompts import context_message
+    line = "The user asked you to search the web: call web_search in this reply."
+    for question in ("Search đi", "tìm trên mạng giúp mình", "Tra google xem còn mở không"):
+        assert line in context_message({**TURN, "question": question}, web=True)
+    assert line not in context_message({**TURN, "question": "Search đi"})          # web search not offered
+    assert line not in context_message({**TURN, "question": "lẩu bò Ban Công ở đâu"}, web=True)
+
+
+def test_search_requests_are_matched_narrowly():
+    from app.assistant.prompts import asked_to_search
+    for question in ("search đi", "Tìm lại đi", "google giúp mình", "lên mạng xem quán còn mở không", "tim tren mang"):
+        assert asked_to_search(question), question
+    for question in ("tìm đi đâu chơi tối nay", "chỗ nào bán măng ngon, tìm măng ở đâu", "gửi link google map quán đó",
+                     "search for cafés near the hotel"):
+        assert not asked_to_search(question), question
+
+
+def test_an_english_question_around_a_vietnamese_place_name_is_english():
+    from app.assistant.prompts import reply_language
+    assert reply_language("What should we eat in Hội An tonight?", "vi") == "English"
+    assert reply_language("Quán phở nào ngon ở Hội An?", "en") == "Vietnamese"
+
+
+def test_the_one_to_one_context_has_the_profile_and_asks_for_a_title():
+    from app.assistant.prompts import context_message
+    turn = {"conversationType": "ASSISTANT", "locale": "vi", "user": {"name": "An"},
+            "question": "lẩu bò Ban Công ở đâu", "profile": "Ở Hà Nội\nĂn cay", "needsTitle": True}
+    text = context_message(turn)
+    assert "About the user (kept across chats):\nỞ Hà Nội\nĂn cay" in text
+    assert 'This chat has no title yet: return "title".' in text
+    later = context_message({**turn, "profile": None, "needsTitle": False})
+    assert "About the user (kept across chats): none yet." in later and "no title" not in later
+    assert "About the user" not in context_message(TURN)                             # a trip chat
+
+
+def test_title_and_profile_are_passed_on_bounded():
+    reply = clean_reply({"answer": "x", "title": "  Lẩu bò Cầu Giấy " + "x" * 100,
+                         "profile": " Ở Hà Nội\nĂn cay "}, set(), {})
+    assert reply["title"] == ("Lẩu bò Cầu Giấy " + "x" * 100)[:80]
+    assert reply["profile"] == "Ở Hà Nội\nĂn cay"
+    ignored = clean_reply({"answer": "x", "title": 5, "profile": ["Ở Hà Nội"]}, set(), {})
+    assert "title" not in ignored and "profile" not in ignored
