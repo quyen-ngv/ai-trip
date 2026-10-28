@@ -200,8 +200,27 @@ def _prose_then_json(text: str) -> dict | None:
 
 
 def parse_final(content: str) -> dict:
-    """The model's closing JSON; plain text (a model that ignored the format) becomes the answer."""
-    return parse_json(content) or {"answer": _FENCE.sub("", content or "").strip()}
+    """The model's closing JSON; plain text (a model that ignored the format) becomes the answer.
+    JSON cut off by the output limit keeps its answer text: prod 2026-10-28 posted a whole 3-day
+    plan as raw JSON after thinking and the plan used up the 5000-token limit."""
+    text = _FENCE.sub("", content or "").strip()
+    return parse_json(text) or _salvage_answer(text) or {"answer": text}
+
+
+_ANSWER_KEY = re.compile(r'^\{\s*"answer"\s*:\s*')
+
+
+def _salvage_answer(text: str) -> dict | None:
+    """The complete "answer" string at the head of a JSON object whose tail is missing."""
+    match = _ANSWER_KEY.match(text)
+    if not match:
+        return None
+    try:
+        # strict=False: a raw line break inside the string is a common slip, not a reason to lose it.
+        answer, _ = json.JSONDecoder(strict=False).raw_decode(text, match.end())
+    except ValueError:
+        return None
+    return {"answer": answer} if isinstance(answer, str) and answer.strip() else None
 
 
 # Words that say what a place is rather than which one it is. A name reduced to nothing but these

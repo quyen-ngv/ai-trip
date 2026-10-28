@@ -1016,3 +1016,12 @@ def test_title_and_profile_are_passed_on_bounded():
     assert reply["profile"] == "Ở Hà Nội\nĂn cay"
     ignored = clean_reply({"answer": "x", "title": 5, "profile": ["Ở Hà Nội"]}, set(), {})
     assert "title" not in ignored and "profile" not in ignored
+
+
+def test_a_reply_cut_off_by_the_output_limit_keeps_its_answer_text():
+    # Prod 2026-10-28: a 3-day plan after 2,040 thinking tokens hit max_tokens mid-JSON and the
+    # whole JSON was posted as the answer.
+    from app.assistant.graph import parse_final
+    cut = '{"answer": "Mình lên plan 3 ngày ở Phú Quốc.\n- **Ngày 1**: Bãi Trường", "places": [{"placeId": "e9f4'
+    assert parse_final(cut) == {"answer": "Mình lên plan 3 ngày ở Phú Quốc.\n- **Ngày 1**: Bãi Trường"}
+    assert parse_final('{"answer": "chưa xong') == {"answer": '{"answer": "chưa xong'}
