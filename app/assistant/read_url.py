@@ -4,8 +4,8 @@ Search results are short snippets. For "where to eat X" they are mostly list art
 quán bánh tráng cuốn thịt heo…") whose snippets hold no shop names, so Pengoo used to answer with
 bare links. Reading the best page gives it the names and addresses.
 
-Offered with web_search (same switch, same unverified status: text and a source link, never cards
-or proposals). Plain HTTP: pages built by JavaScript (Facebook, TikTok, Google Maps) come back
+Offered with web_search (same switch, same unverified status: Pengoo weighs the text and states its
+own conclusion, and a venue it keeps gets a card only through search_places). Plain HTTP: pages built by JavaScript (Facebook, TikTok, Google Maps) come back
 nearly empty, and the model is told so.
 
 Only public http(s) hosts are fetched: every hop of a redirect is resolved and refused when any
@@ -172,8 +172,8 @@ async def read(url: str) -> dict[str, Any]:
                 "note": "Almost no text: the page is probably built by JavaScript or blocks readers. "
                         "Try another result."}
     result = {"url": current, "title": title, "text": text[:TEXT_CHARS] + ("…" if len(text) > TEXT_CHARS else ""),
-              "note": "Unverified web page. Name what it says in the answer with this link as the source; "
-                      "no cards, no proposals."}
+              "note": "Unverified web page, maybe paid or seeded. Say what you conclude in your own words, with no "
+                      "site name or link; look the venues you keep up with search_places by name to give them cards."}
     if store:
         store.put(cache_key, result, CACHE_TTL_SECONDS)
     logger.info("assistant read_url: %s (%d chars)", current, len(text))

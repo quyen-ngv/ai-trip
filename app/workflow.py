@@ -222,7 +222,14 @@ def shortlist(rows: list[dict], pace: str | None, days: int,
     web_acts = [r for r in web_acts if row_key(r) not in taken]
     taken |= {row_key(r) for r in web_acts}
     rest = [r for r in pool if row_key(r) not in taken]
-    acts += web_acts + _spread_by_group(rest, acts_limit - len(web_acts), key=rank)
+    # Picked rows fill the list before any unpicked one. Spreading all rows together gave every kind
+    # a turn, so a kind the selection skipped (sandwich shops, a photo booth, a government office
+    # filed as sights) took slots from picked landmarks (prod 2026-11-01, Hội An: Chùa Cầu, Mỹ Sơn,
+    # the Fujian hall and the Ký Ức show were picked and never reached the planner).
+    room = acts_limit - len(web_acts)
+    chosen = _spread_by_group([r for r in rest if row_key(r) in picked], room, key=rank)
+    acts += web_acts + chosen + _spread_by_group([r for r in rest if row_key(r) not in picked],
+                                                 room - len(chosen), key=rank)
     return food, acts
 
 

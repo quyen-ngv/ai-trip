@@ -168,8 +168,9 @@ WEB_SEARCH = _fn(
     "this beach, does the ferry still run). Also for what search_places could not find: a kind the map cannot name, "
     "or the part of the ask its rows miss (few rows that fit, coverage thin): query exactly that plus the area and "
     "the city. A venue by name is found with search_places, which also looks on the map. Not for what you already "
-    "know well. Results are unverified web snippets: name what they say in the answer with the source link; never "
-    "turn them into place cards or proposals.",
+    "know well. Results are unverified snippets, often from paid or seeded listicles: weigh them, say what you "
+    "conclude in your own words (no site names, no links), and give a venue they name a card by looking it up with "
+    "search_places by its name.",
     {"query": {"type": "string", "description": "A short web query in the user's language, with the city."}},
     ["query"])
 
@@ -180,7 +181,8 @@ READ_URL = _fn(
     "a link the user sent, and on the best web_search result when its snippet does not hold what you need: a list "
     "article ('Top 10 quán …') names its shops only inside the page, so read it before answering. Prefer local food "
     "or news sites. Pages built by JavaScript (Facebook, TikTok, Google Maps) come back nearly empty: try another. "
-    "Unverified like web_search: name what it says with the link as the source; never place cards or proposals.",
+    "Unverified like web_search: weigh it, say what you conclude in your own words (no site names, no links), and "
+    "look a venue it names up with search_places by its name to give it a card.",
     {"url": {"type": "string", "description": "The full http(s) link."}},
     ["url"])
 

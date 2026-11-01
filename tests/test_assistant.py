@@ -751,6 +751,21 @@ async def test_an_answer_over_a_thin_search_is_sent_back_once_to_search_the_web(
     assert java.replies[0]["markdown"] == "Có, **chợ cá** họp lúc 5h sáng."
 
 
+def test_the_answer_after_a_web_push_keeps_the_plan_it_dropped():
+    # Prod 2026-11-01: a whole Đà Lạt plan was written, the web push followed, and the answer after
+    # the web search came back with no proposals and no cards.
+    plan = {"action": "NEW_TRIP", "plan": {"name": "Đà Lạt 3N2Đ", "days": []}}
+    draft = {"answer": "Plan", "proposals": [plan], "places": [{"placeId": "p1"}, {"placeId": "p2"}]}
+    after = {"answer": "Thêm homestay", "proposals": [], "places": [{"placeId": "p2"}, {"placeId": "map:G:9"}]}
+    kept = graph_module.keep_draft(after, draft)
+    assert kept["answer"] == "Thêm homestay" and kept["proposals"] == [plan]
+    assert [p["placeId"] for p in kept["places"]] == ["p2", "map:G:9", "p1"]
+    # A new plan written after the search replaces the old one.
+    newer = {**after, "proposals": [{"action": "NEW_TRIP", "plan": {"name": "Đà Lạt mới"}}]}
+    assert graph_module.keep_draft(newer, draft)["proposals"] == newer["proposals"]
+    assert graph_module.keep_draft(after, None) is after
+
+
 def test_read_url_keeps_the_shop_names_of_a_list_article():
     from app.assistant.read_url import html_to_text
     title, text = html_to_text(

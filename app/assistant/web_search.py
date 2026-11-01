@@ -2,8 +2,9 @@
 
 Offered only when Java allows it for the turn (`limits.webSearch`, config ASSISTANT.WEB_SEARCH_ENABLED)
 and a provider is configured here; the graph allows one call per turn. Results are short snippets
-with their links. They never become place cards or proposals, because nothing in them is checked
-against the catalogue.
+with their links. A snippet never becomes a card by itself, because nothing in it is checked: a venue
+it names gets one only when search_places finds it by name (catalogue or map). The links stay in the
+result for the model to weigh; the answer cites no site.
 
 Providers (ASSISTANT_WEB_SEARCH_PROVIDER):
   openai (default)  The model's own web search, the same way the trip planner researches
@@ -134,7 +135,10 @@ async def search(query: str) -> dict[str, Any]:
 
 def _reply(results: list[dict]) -> dict[str, Any]:
     return {"results": results,
-            "note": "Unverified web snippets. Mention them as 'theo <source>' with the link; no cards, no proposals."}
+            "note": ("Unverified web snippets, often paid or seeded listicles. Trust a venue that two pages name "
+                     "or the map finds; say what you conclude in your own words, with no site names or links; "
+                     "look the venues you keep up with search_places by name (one `searches` entry each) so they "
+                     "get cards.")}
 
 
 async def _model_search(client: httpx.AsyncClient, query: str) -> list[dict]:

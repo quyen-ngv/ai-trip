@@ -74,8 +74,9 @@ MAP_PLACE_ACTIONS = ("ADD", "REPLACE")
 # Uses of one tool in one answer (items for the batch tools). Past the limit the call is refused
 # with a short note and does not count toward the budget: the log showed get_weather asked for a
 # price question and get_place_community for nine search rows one after another.
+# search_places: a plan's batch of six kinds, then a batch looking up by name the venues the web named.
 TOOL_LIMITS = {"get_weather": 1, "get_place_community": 2, "get_place_details": 8, "travel_time": 12,
-               "search_places": 8, "explore_destinations": 1, "get_destination_guide": 2, "get_local_dishes": 1,
+               "search_places": 14, "explore_destinations": 1, "get_destination_guide": 2, "get_local_dishes": 1,
                "search_events": 2, "search_meetups": 1, "search_public_trips": 2, "get_budget": 1,
                "get_trip_checkins": 1, "rank_trip_places": 1, "list_my_trips": 1, "get_trip": 2}
 TOOL_LIMIT_DEFAULT = 3
@@ -145,6 +146,9 @@ class State(TypedDict, total=False):
     nudged: bool
     thin: bool
     web_pushed: bool
+    # The answer written before WEB_PUSH sent the model back to search: its cards and proposals
+    # survive when the answer written after the search leaves them out.
+    draft: dict
     final: dict
     usage: dict
     stop_reason: str
@@ -630,12 +634,15 @@ FOOD_TYPES = {"RESTAURANT", "STREET_FOOD", "CAFE", "TEA", "BAR", "BAKERY", "DESS
 # Not "the app's map": map rows (`source: "map"`) are a different source the model must tell apart.
 THIN_CATALOGUE_NOTE = ("The app's catalogue has little for this ask: {reasons}. Call "
                        "web_search now for what the user asked (the kind, dish or fact plus the area and the city, "
-                       "in the user's language), then answer with the best of both: rows here that truly fit as "
-                       "place cards, web finds named in the text with their source link. Leave out rows that do "
-                       "not fit; do not list them as a fallback.")
+                       "in the user's language), then look the venues you keep up with search_places by name so "
+                       "they get cards, and answer with the best of both: rows here that truly fit and the web "
+                       "finds, in your own words with no site names or links. Leave out rows that do not fit; do "
+                       "not list them as a fallback.")
 WEB_PUSH = ("Your search came back thin for this ask and web_search is still unused. Do not answer with places that "
-            "do not fit or with 'ask the locals': call web_search now for exactly what the user asked, then write "
-            "the final JSON with what fits.")
+            "do not fit or with 'ask the locals': call web_search now for exactly what the user asked, look the "
+            "venues you keep up with search_places by name so they get cards, then write the final JSON with what "
+            "fits. Keep every proposal and plan card of the answer you just wrote, updated with what you find "
+            "(a better stay found on the web replaces the old one in the plan).")
 
 
 def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -> Any:
@@ -678,6 +685,24 @@ def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -
     if not reasons:
         return result
     return {**result, "coverage": "thin", "note": THIN_CATALOGUE_NOTE.format(reasons="; ".join(reasons))}
+
+
+def keep_draft(final: dict, draft: dict | None) -> dict:
+    """The answer after WEB_PUSH, with what it dropped from the answer before it. Prod 2026-11-01:
+    the model wrote a whole Đà Lạt plan, was sent back to search the web for homestays, and the
+    answer it wrote after the search had no proposals and no cards, so the user never got a plan."""
+    if not isinstance(draft, dict):
+        return final
+    out = dict(final)
+    for key in ("proposals", "places"):
+        before = [item for item in draft.get(key) or [] if isinstance(item, dict)]
+        after = [item for item in out.get(key) or [] if isinstance(item, dict)]
+        if key == "proposals":
+            out[key] = after or before
+        else:
+            seen = {str(item.get("placeId")) for item in after}
+            out[key] = after + [item for item in before if str(item.get("placeId")) not in seen]
+    return out
 
 
 def web_offered(turn: dict) -> bool:
@@ -778,8 +803,8 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
             # restaurants 3-4 km away, ignored the thin flag, listed them and told the user to ask
             # the locals. One more round to search for what was actually asked.
             return {"messages": history + [message, {"role": "system", "content": WEB_PUSH}],
-                    "usage": usage, "web_pushed": True, **told}
-        final = final or parse_final(content)
+                    "usage": usage, "web_pushed": True, "draft": final or parse_final(content), **told}
+        final = keep_draft(final or parse_final(content), state.get("draft"))
         if not str(final.get("answer") or "").strip():
             # An empty JSON answer after a plain-text round: that text was the answer.
             earlier = [m.get("content") for m in state["messages"]
