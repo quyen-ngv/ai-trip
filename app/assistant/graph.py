@@ -105,7 +105,7 @@ _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIME = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 PROPOSAL_ACTIONS = ("ADD", "MOVE", "UPDATE_TIME", "REMOVE", "REPLACE",
                     "ADD_DAYS", "PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES",
-                    "EDIT_TRIP", "EDIT_ACTIVITY", "NEW_ACTIVITY", "ADD_EXPENSE", "EDIT_EXPENSE",
+                    "INSERT_DAYS", "MOVE_DAY", "EDIT_TRIP", "EDIT_ACTIVITY", "NEW_ACTIVITY", "ADD_EXPENSE", "EDIT_EXPENSE",
                     "REMOVE_EXPENSE", "ADD_NOTE", "ADD_GUEST", "NEW_TRIP", "PLAN_DAYS")
 MAX_PROPOSALS = 10
 # A planned trip (NEW_TRIP) or the days of one (PLAN_DAYS); Java checks every value again.
@@ -133,7 +133,7 @@ _CHANGE_FIELDS = {
     "ADD_GUEST": ("guestName",),
 }
 # Changes to the days themselves go first (Java keeps one and the adds it needs).
-_DAY_CHANGES = ("PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES", "ADD_DAYS")
+_DAY_CHANGES = ("PREPEND_DAYS", "REMOVE_DAYS", "SWAP_DAYS", "SHIFT_DATES", "INSERT_DAYS", "MOVE_DAY", "ADD_DAYS")
 
 
 class State(TypedDict, total=False):
