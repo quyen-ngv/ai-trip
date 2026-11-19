@@ -13,6 +13,11 @@ of an earlier call is answered with a note instead of running again, an unknown 
 nothing, and `get_place_details` / `travel_time` take a list so one model round fetches what
 used to take six (the model asked for one place or one hop per round).
 
+2026-11-14 (prod call log, 88 chat plans): a plan is checked in code before it is sent
+(`plan_check`). Stops carrying another place's id are relinked or lose the id, a trip no longer
+"starts" at its own destination, and a plan with a missing meal, a snack for dinner, a meal with no
+venue or a night without a stay sends the model back once (PLAN_REPAIR) to finish it.
+
 2026-10-28: search_places may return map rows (`map:` ids, `source: "map"`) for names the catalogue
 lacks. The model only ever writes such an id; the reply rebuilds each map place (card, proposal,
 plan stop) from the row this turn's tool returned, so a coordinate the model wrote never reaches
@@ -31,7 +36,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .. import ai_log
-from . import images, read_url, web_search
+from . import images, plan_check, read_url, web_search
 from .chat_model import ChatModel
 from .gateway import JavaGateway, TurnClosed
 from .prompts import SYSTEM, fold, history_messages, question_message
@@ -146,6 +151,8 @@ class State(TypedDict, total=False):
     nudged: bool
     thin: bool
     web_pushed: bool
+    # The model was sent back once to finish a plan that plan_check found incomplete.
+    plan_repaired: bool
     # The answer written before WEB_PUSH sent the model back to search: its cards and proposals
     # survive when the answer written after the search leaves them out.
     draft: dict
@@ -206,9 +213,173 @@ def _prose_then_json(text: str) -> dict | None:
 def parse_final(content: str) -> dict:
     """The model's closing JSON; plain text (a model that ignored the format) becomes the answer.
     JSON cut off by the output limit keeps its answer text: prod 2026-10-28 posted a whole 3-day
-    plan as raw JSON after thinking and the plan used up the 5000-token limit."""
+    plan as raw JSON after thinking and the plan used up the 5000-token limit. JSON whose brackets
+    do not pair up is rebalanced first (`rebalance_json`)."""
     text = _FENCE.sub("", content or "").strip()
-    return parse_json(text) or _salvage_answer(text) or {"answer": text}
+    return parse_json(text) or parse_rebalanced(text) or _salvage_answer(text) or {"answer": text}
+
+
+_CLOSERS = {"{": "}", "[": "]"}
+
+
+def rebalance_json(text: str) -> str:
+    """The JSON object starting at the first "{", with its brackets paired up.
+
+    Prod 2026-11-12..15: four answers carrying a whole plan (a NEW_TRIP or PLAN_DAYS of 3,500-6,700
+    characters) closed the nested days/items one level too few or too many ("…}]}]}}}]"). The
+    answer text survived, the plan card did not, and the user saw "the plan is ready" with no
+    plan ("Chưa thấy cập nhật"). A closer that matches an outer bracket closes the ones left open
+    inside it; a closer that matches nothing open is dropped; whatever is open at the end is
+    closed. Strings (and their escapes) are copied as they are."""
+    start = text.find("{")
+    if start < 0:
+        return text
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = escaped = False
+    for char in text[start:]:
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+        elif char in _CLOSERS:
+            stack.append(_CLOSERS[char])
+            out.append(char)
+        elif char in "}]":
+            if char not in stack:
+                continue                              # nothing open of that kind: a stray closer
+            while stack and stack[-1] != char:
+                out.append(stack.pop())               # close what was left open inside it
+            out.append(stack.pop())
+            if not stack:
+                break                                 # the root object is complete
+        else:
+            out.append(char)
+    if in_string:
+        out.append('"')
+    out.extend(reversed(stack))
+    return "".join(out)
+
+
+def _closers_outside_strings(text: str) -> list[int]:
+    """Positions of "}" and "]" that are JSON syntax, not characters inside a string."""
+    found: list[int] = []
+    in_string = escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "}]":
+            found.append(index)
+    return found
+
+
+# Repairs tried on one answer: each fixes one bracket, so a handful is plenty.
+MAX_JSON_REPAIRS = 6
+
+
+def _plan_shape(value: Any) -> int:
+    """How plan-like the plans of a parsed answer are: days in a plan's "days" and stops in a day's
+    "items" count up; a day nested among the stops of another day counts heavily against."""
+    score = 0
+    for proposal in (value.get("proposals") or []) if isinstance(value, dict) else []:
+        plan = proposal.get("plan") if isinstance(proposal, dict) else None
+        for day in (plan.get("days") or []) if isinstance(plan, dict) else []:
+            if not isinstance(day, dict):
+                continue
+            score += 2 if "dayNumber" in day else -5
+            for item in day.get("items") or []:
+                score += -5 if isinstance(item, dict) and ("dayNumber" in item or "items" in item) else 1
+    return score
+
+
+def _parse_error_at(text: str) -> int | None:
+    """Where JSON parsing of `text` fails, or None when it parses."""
+    try:
+        json.loads(text)
+        return None
+    except json.JSONDecodeError as error:
+        return error.pos
+
+
+def _open_closer_at(text: str, position: int) -> str | None:
+    """The closer the innermost bracket still open at `position` needs, outside strings."""
+    stack: list[str] = []
+    in_string = escaped = False
+    for char in text[:position]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in _CLOSERS:
+            stack.append(_CLOSERS[char])
+        elif char in "}]" and stack:
+            stack.pop()
+    return stack[-1] if len(stack) > 1 else None      # never close the root object here
+
+
+def parse_rebalanced(text: str) -> dict | None:
+    """`parse_json` of the rebalanced text, keeping it only when the answer survived whole.
+
+    When brackets pair up but one closed too early (prod 2026-11-12: "…}]}]}, "budget": …" ends the
+    plan, so its last keys land in the proposal and "summary" in the proposals list), the closer
+    nearest before the parse error is removed and the text rebalanced again, while each try gets
+    further into the text."""
+    if "{" not in text:
+        return None
+    candidate = rebalance_json(text)
+    reached = _parse_error_at(candidate)
+    for _ in range(MAX_JSON_REPAIRS):
+        if reached is None:
+            break
+        # Two edits at the error: drop the closer just before it (one closed too early), or close
+        # what is still open before the comma that precedes it (one closer missing). Keep the one
+        # that parses furthest.
+        tries = []
+        earlier = [index for index in _closers_outside_strings(candidate) if index < reached]
+        if earlier:
+            tries.append(rebalance_json(candidate[:earlier[-1]] + candidate[earlier[-1] + 1:]))
+        comma = candidate.rfind(",", 0, reached)
+        missing = _open_closer_at(candidate, comma) if comma > 0 else None
+        if missing:
+            tries.append(rebalance_json(candidate[:comma] + missing + candidate[comma:]))
+        scored = [(_parse_error_at(fixed), fixed) for fixed in tries]
+        done = [fixed for at, fixed in scored if at is None]
+        if done:
+            # Both edits can give valid JSON of a different shape; the one whose plans look like
+            # plans wins (on a tie, dropping a closer, the slip seen most in prod).
+            candidate, reached = max(done, key=lambda fixed: _plan_shape(json.loads(fixed))), None
+            break
+        better = [(at, fixed) for at, fixed in scored if at > reached]
+        if not better:
+            return None                               # no progress: keep the plain answer
+        reached, candidate = max(better, key=lambda pair: pair[0])
+    if reached is not None:
+        return None
+    fixed = parse_json(candidate)
+    if fixed is None or not str(fixed.get("answer") or "").strip():
+        return None
+    logger.info("assistant answer JSON repaired (%d chars)", len(text))
+    return fixed
 
 
 _ANSWER_KEY = re.compile(r'^\{\s*"answer"\s*:\s*')
@@ -278,6 +449,24 @@ def attach_mentioned_places(final: dict, candidates: dict[str, str], limit: int 
             places.append({"placeId": place_id})
             have.add(place_id)
     return {**final, "places": places}
+
+
+def attach_mentioned_destinations(final: dict, candidates: dict[str, str], limit: int = 3) -> dict:
+    """Destination cards for the destinations the answer names, when the model gave none.
+
+    Prod 2026-11-12..15: all 13 "where should I go in November" answers called
+    explore_destinations, named three destinations in bold and returned no "destinations", so the
+    user got text with no "plan this trip" button and most stopped there. `candidates` holds the
+    destinations this turn's tools returned (id -> name)."""
+    if final.get("destinations") or not candidates:
+        return final
+    # Only the picks, which the answer writes in bold: "**Mộc Châu** … cách Hà Nội 200 km" is not
+    # a recommendation of Hà Nội.
+    picks = " | ".join(re.findall(r"\*\*([^*]{2,80})\*\*", str(final.get("answer") or "")))
+    found = mentioned_places(picks, candidates)[:limit]
+    if not found:
+        return final
+    return {**final, "destinations": [{"id": destination_id} for destination_id in found]}
 
 
 def looks_like_announcement(content: str, acted: bool = False) -> bool:
@@ -460,10 +649,12 @@ def _map_ref(map_rows: dict[str, dict] | None, place_id: Any) -> dict | None:
     return map_place((map_rows or {}).get(str(place_id or "").strip()))
 
 
-def clean_plan(raw: Any, map_rows: dict[str, dict] | None = None) -> dict | None:
+def clean_plan(raw: Any, map_rows: dict[str, dict] | None = None,
+               place_rows: dict[str, dict] | None = None, quiet: bool = False) -> dict | None:
     """The plan of a NEW_TRIP / PLAN_DAYS proposal, bounded to what Java accepts; None when no day
     has a stop with a name or a place. A stop on a map row of this turn (`map:` placeId) carries
-    the row's position and provider id instead of a placeId."""
+    the row's position and provider id instead of a placeId. With `place_rows` (the catalogue
+    places this turn's tools showed), a stop carrying another place's id is relinked or loses it."""
     if not isinstance(raw, dict):
         return None
     plan = _texts(raw, _PLAN_TEXT)
@@ -528,7 +719,28 @@ def clean_plan(raw: Any, map_rows: dict[str, dict] | None = None) -> dict | None
     if not days:
         return None
     plan["days"] = days
+    plan_check.drop_start_at_destination(plan)
+    if place_rows:
+        for fix in plan_check.relink_places(plan, place_rows):
+            if not quiet:      # logged once, by the reply; the gap check runs the same fix again
+                logger.info("plan stop relinked: %s", fix)
     return plan
+
+
+def plan_gaps_of(final: dict, map_rows: dict[str, dict] | None, place_rows: dict[str, dict]) -> list[dict]:
+    """What the plans of an answer still lack (see plan_check). A plan the model marked as the
+    user's own (`fromUser`: copied from their photo or text) is not judged."""
+    gaps: list[dict] = []
+    for item in final.get("proposals") or []:
+        if not isinstance(item, dict) or item.get("action") not in PLAN_ACTIONS:
+            continue
+        raw = item.get("plan")
+        if not isinstance(raw, dict) or raw.get("fromUser") is True:
+            continue
+        plan = clean_plan(raw, map_rows, place_rows, quiet=True)
+        if plan:
+            gaps += plan_check.plan_gaps(plan, place_rows, item.get("action") == "NEW_TRIP")
+    return gaps[:plan_check.MAX_GAPS]
 
 
 def clean_questions(raw: Any) -> list[dict]:
@@ -550,7 +762,8 @@ def clean_questions(raw: Any) -> list[dict]:
 
 
 def clean_reply(final: dict, allowed_places: set[str], usage: dict,
-                ids: dict[str, set[str]] | None = None, map_rows: dict[str, dict] | None = None) -> dict:
+                ids: dict[str, set[str]] | None = None, map_rows: dict[str, dict] | None = None,
+                place_rows: dict[str, dict] | None = None) -> dict:
     """What Java receives: bounded lists, places only from this turn's tool results, earlier
     cards or the trip; buttons only for ids seen in this turn. A `map:` id becomes a `mapPlace`
     rebuilt from this turn's map row (`map_rows`), in a card, an ADD/REPLACE or a plan stop."""
@@ -585,7 +798,7 @@ def clean_reply(final: dict, allowed_places: set[str], usage: dict,
             if changes:
                 proposal["changes"] = changes
             if item.get("action") in PLAN_ACTIONS:
-                plan = clean_plan(item.get("plan"), map_rows)
+                plan = clean_plan(item.get("plan"), map_rows, place_rows)
                 if plan is None:
                     continue
                 proposal["plan"] = plan
@@ -638,11 +851,18 @@ THIN_CATALOGUE_NOTE = ("The app's catalogue has little for this ask: {reasons}. 
                        "they get cards, and answer with the best of both: rows here that truly fit and the web "
                        "finds, in your own words with no site names or links. Leave out rows that do not fit; do "
                        "not list them as a fallback.")
+# The line the thinking view shows while the plan goes back for its missing meals or stay.
+PLAN_CHECK_THOUGHT = {"vi": "Soát lại plan: bữa ăn, chỗ ở và giờ giấc từng ngày",
+                      "en": "Checking the plan: meals, the stay and each day's timing"}
 WEB_PUSH = ("Your search came back thin for this ask and web_search is still unused. Do not answer with places that "
             "do not fit or with 'ask the locals': call web_search now for exactly what the user asked, look the "
             "venues you keep up with search_places by name so they get cards, then write the final JSON with what "
             "fits. Keep every proposal and plan card of the answer you just wrote, updated with what you find "
-            "(a better stay found on the web replaces the old one in the plan).")
+            "(a better stay found on the web replaces the old one in the plan). The user has NOT seen the answer you "
+            "just wrote: the next one is your first reply to them, so it never says what you changed, kept, "
+            "checked or looked up again (no \"Mình đổi chỗ ở sang…\", \"Mình đã kiểm tra thêm…\"); it answers the "
+            "question as if written once. When the user said they do not need something (a hotel, more places), "
+            "do not search for it.")
 
 
 def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -> Any:
@@ -702,7 +922,21 @@ def keep_draft(final: dict, draft: dict | None) -> dict:
         else:
             seen = {str(item.get("placeId")) for item in after}
             out[key] = after + [item for item in before if str(item.get("placeId")) not in seen]
+    # A second round that returns only the plan keeps what the first one said and offered.
+    for key in ("answer", "suggestions"):
+        if not out.get(key) and draft.get(key):
+            out[key] = draft[key]
     return out
+
+
+# A question this long is a plan the user pasted, not a request for one.
+PASTED_PLAN_CHARS = 500
+
+
+def user_material(turn: dict) -> bool:
+    """The question brings the user's own plan (photos, or a long pasted text): it is copied, not
+    judged, so the plan check leaves it alone."""
+    return bool(turn.get("images")) or len(str(turn.get("question") or "")) > PASTED_PLAN_CHARS
 
 
 def web_offered(turn: dict) -> bool:
@@ -736,6 +970,9 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         for place in row.get("mapPlaces") or []:
             if isinstance(place, dict) and map_place(place):
                 map_rows[str(place["id"])] = place
+    # Catalogue places with their kind and types, for the plan check: history cards (name only),
+    # then every row this turn's tools return.
+    place_rows: dict[str, dict] = {pid: {"name": name} for pid, name in names.items() if pid in allowed_places}
     # Cards already shown are not attached again just because the answer names them.
     shown_map_ids = set(map_rows)
     trip = turn.get("trip") or {}
@@ -805,6 +1042,18 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
             return {"messages": history + [message, {"role": "system", "content": WEB_PUSH}],
                     "usage": usage, "web_pushed": True, "draft": final or parse_final(content), **told}
         final = keep_draft(final or parse_final(content), state.get("draft"))
+        if budget_left > 0 and not state.get("plan_repaired") and not user_material(turn):
+            # Prod 2026-11-14: one chat plan in three had a day without lunch or dinner, a meal with
+            # no venue or a night without a stay. One more round to finish it; the plan written so
+            # far is kept as the draft in case that round comes back without one.
+            gaps = plan_gaps_of(final, map_rows, place_rows)
+            if plan_check.worth_repair(gaps):
+                logger.info("assistant turn %s: plan incomplete, repair round: %s", turn.get("turnId"),
+                            [(g["kind"], g["day"], g.get("meal")) for g in gaps])
+                await java.step("thought", {}, PLAN_CHECK_THOUGHT.get(
+                    "vi" if str(turn.get("locale") or "vi").lower().startswith("vi") else "en"))
+                return {"messages": history + [message, {"role": "system", "content": plan_check.repair_message(gaps)}],
+                        "usage": usage, "plan_repaired": True, "draft": final, **told}
         if not str(final.get("answer") or "").strip():
             # An empty JSON answer after a plain-text round: that text was the answer.
             earlier = [m.get("content") for m in state["messages"]
@@ -824,6 +1073,7 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         if key not in answered:
             result = await java.tool(name, args)
             collect_names(result, names, ids, map_rows)
+            plan_check.collect_place_rows(result, place_rows)
             answered[key] = result
         return answered[key]
 
@@ -926,7 +1176,13 @@ def build_graph(turn: dict, java: JavaGateway, model: ChatModel):
         found.update({map_id: str(row.get("name") or "") for map_id, row in map_rows.items()
                       if map_id not in shown_map_ids and map_place(row)})
         final = attach_mentioned_places(state.get("final") or {}, found)
-        reply = clean_reply(final, allowed_places, state.get("usage") or {}, ids, map_rows)
+        final = attach_mentioned_destinations(
+            final, {d: names[d] for d in ids.get("destination", set()) if d in names})
+        reply = clean_reply(final, allowed_places, state.get("usage") or {}, ids, map_rows, place_rows)
+        left = plan_gaps_of(final, map_rows, place_rows)
+        if left:
+            logger.info("assistant turn %s: plan sent with gaps (repaired=%s): %s", turn.get("turnId"),
+                        bool(state.get("plan_repaired")), [(g["kind"], g["day"], g.get("meal")) for g in left])
         if state.get("stop_reason"):
             reply["stopReason"] = state["stop_reason"]
         await java.reply(reply)
@@ -1022,7 +1278,7 @@ async def run_turn(turn: dict, token: str, model: ChatModel | None = None) -> No
         limits = turn.get("limits") or {}
         # Each agent round plus its tool round is two graph steps; on top of the budget, the rounds
         # refused past it, one nudge round, start and finish.
-        limit = 2 * (int(limits.get("maxToolCalls") or 6) + 2 + MAX_OVER_BUDGET_ROUNDS) + 6
+        limit = 2 * (int(limits.get("maxToolCalls") or 6) + 2 + MAX_OVER_BUDGET_ROUNDS) + 10
         # Java sends how long it waits before failing the turn itself, minus a margin (a PRO budget
         # of 20 tool calls needs far longer than the old fixed 120 s).
         timeout = int(limits.get("timeoutSeconds") or TURN_TIMEOUT_SECONDS)

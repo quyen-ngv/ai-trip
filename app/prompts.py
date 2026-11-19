@@ -142,6 +142,7 @@ Every food row is a food venue; every activity row is a sight or activity. Row f
 - price: band per person such as "1-100k₫" or a level such as "affordable"
 - tags: facts from the venue's listing: meals served (breakfast, brunch, lunch, dinner, dessert, late_night), kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, groups, solo, view, rooftop, live_music, outdoor, reservation_required, touristy
 - menu (food only): signature dishes
+- hot: {"7d": n, "30d": m} = OnDetour trips and check-ins at the place in the last 7 / 30 days, i.e. what travellers here pick right now; between stops that fit equally, prefer the hot one and give a 7d-hot sight a good slot. It never outweighs the traveller's constraints, the hours or the day's geography
 - source: "web" = recommended by cited travel articles; "web_unlocated" = same but with no verified location, so place it where it fits the day without relying on geography; "social_video" rows also carry videoSequence, videoDay, videoTime, optionGroupId, optionIndex, relation, resolutionStatus
 Treat price, tags and menu as facts: breakfast goes to breakfast-tagged venues or clear breakfast food; children prefer "kids" venues and skip alcohol-led bars; wheelchair users need "wheelchair"; diets need matching tags, kinds or menu; the budget is read from price."""
 
@@ -171,14 +172,55 @@ def language(locale: str | None) -> str:
     return LANG["vi"] if (locale or "").lower().startswith("vi") else LANG["en"]
 
 
+def party(req: dict[str, Any]) -> tuple[int, int] | None:
+    """(adults, children) when the traveller said how many go (`preferences.adults` / `.children`
+    of the request); None when they did not, so nothing is assumed."""
+    prefs = req.get("preferences") if isinstance(req.get("preferences"), dict) else {}
+    try:
+        adults = int(prefs.get("adults") or 0)
+        children = int(prefs.get("children") or 0)
+    except (TypeError, ValueError):
+        return None
+    if adults < 1 or adults > 30 or children < 0 or children > 20:
+        return None
+    return adults, children
+
+
+def party_lines(adults: int, children: int) -> list[str]:
+    """The head count and what it changes. Code-owned and per request, so it sits in the profile
+    (after the cached rules): the editable traveller rules know the kind of group, not its size."""
+    total = adults + children
+    people = f"{adults} adult{'s' if adults != 1 else ''}" + (
+        f", {children} child{'ren' if children != 1 else ''}" if children else "")
+    lines = [f"Party: {total} {'person' if total == 1 else 'people'} ({people})"]
+    if total == 1:
+        lines.append("Party size rule: one traveller. Food venues where eating alone is easy (noodle shops, "
+                     "rice plates, street food, counters); no hotpot, grill or seafood sets sold for a table.")
+    elif total >= 5:
+        lines.append(f"Party size rule: a group of {total}. Food venues that seat a group (tags groups or "
+                     "reservation_recommended, dishes to share such as lẩu, nướng, hải sản) and \"book ahead\" "
+                     "in their description; one stop fewer a day than the pace allows and each 10-15 minutes "
+                     "longer, since a group moves slowly; the trip overview names transport that fits "
+                     f"{total} people (a 7- or 16-seat car with a driver, or motorbikes in pairs).")
+    if children:
+        lines.append(f"Party size rule: {children} child{'ren' if children != 1 else ''} in the party, so the "
+                     "children rules above apply even when the group text does not say it, and every day has "
+                     "at least one stop chosen for them.")
+    return lines
+
+
 def preferences_block(req: dict[str, Any], locale: str | None) -> str:
     lines = ["## Traveller profile"]
-    groups = [g for g in (req.get("placeGroups") or []) if g in PLACE_GROUPS]
+    # The app can send one group several times (its old codes all became ATTRACTIONS).
+    groups = list(dict.fromkeys(g for g in (req.get("placeGroups") or []) if g in PLACE_GROUPS))
     lines.append("Interests: " + ("; ".join(f"{g} ({PLACE_GROUPS[g]})" for g in groups) if groups
                                   else "not specified — cover food, culture, nature and attractions"))
     lines.append(f"Pace: {(req.get('pace') or 'BALANCED').upper()}")
     if req.get("groupComposition"):
         lines.append(f"Group: {req['groupComposition']}")
+    size = party(req)
+    if size:
+        lines += party_lines(*size)
     if req.get("travelStyle"):
         lines.append(f"Travel style: {req['travelStyle']}")
     lines.append(f"Discovery style: {(req.get('discoveryStyle') or 'BALANCED').upper()}")
@@ -192,7 +234,12 @@ def preferences_block(req: dict[str, Any], locale: str | None) -> str:
     if acts:
         lines.append("Activity types wanted: " + ", ".join(acts))
     if req.get("budgetMax"):
-        lines.append(f"Budget for the whole trip: {req.get('budgetMin') or 0:,.0f}–{req['budgetMax']:,.0f} {req.get('budgetCurrency') or ''}".strip())
+        budget = f"Budget for the whole trip: {req.get('budgetMin') or 0:,.0f}–{req['budgetMax']:,.0f} {req.get('budgetCurrency') or ''}".strip()
+        if size and sum(size) > 1:
+            # Price bands on the rows are per person, so the planner needs the same unit.
+            budget += (f" for all {sum(size)} people, about {float(req['budgetMax']) / sum(size):,.0f} per person: "
+                       "read each venue's price against the per-person figure")
+        lines.append(budget)
     text = (req.get("preferenceText") or "").strip()
     if text:
         lines.append("USER'S OWN WORDS (highest priority, override defaults when they conflict):\n> " + re.sub(r"\s+", " ", text))
@@ -207,14 +254,15 @@ def build_select_prompt(req: dict[str, Any], locale: str | None, destination: st
     return f"""You shortlist places for a trip planner. Return JSON only.
 
 ## Input
-The full catalogue for {destination} ({days} days) as {{"food":[...],"activities":[...]}}. Row fields (any may be missing): id (short ref), title, kinds or category, desc, price, tags (facts from the listing: meals served = breakfast/lunch/dinner, kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, view, outdoor...), menu (food only: signature dishes), rating, reviews.
+The full catalogue for {destination} ({days} days) as {{"food":[...],"activities":[...]}}. Row fields (any may be missing): id (short ref), title, kinds or category, desc, price, tags (facts from the listing: meals served = breakfast/lunch/dinner, kids, wheelchair, veg, vegan, halal, alcohol, romantic, family, view, outdoor...), menu (food only: signature dishes), rating, reviews, hot ({{"7d": n, "30d": m}} = OnDetour trips and check-ins in the last 7 / 30 days: what travellers here pick right now).
 
 ## Task
 Pick exactly {food_count} food ids and exactly {activity_count} activity ids, in order of fit (all ids of a group when it has fewer). Decide in this order:
 1. The traveller's own words and hard constraints: a diet needs matching tags, kinds or menu; wheelchair needs the wheelchair tag or an obviously flat venue; children skip alcohol-led venues. Leave out anything that conflicts.
 2. Stated interests, travel style, discovery style and budget: a budget request takes cheap price bands; FAMOUS takes many reviews; HIDDEN_GEMS takes well-rated places with few reviews.
 3. Coverage of the whole stay: enough breakfast-capable venues for every morning (breakfast tag, or phở/bánh mì/xôi/cháo/bún-type dishes), lunch and dinner venues, and activities spread across kinds (nature, culture, markets, entertainment) so no kind dominates.
-4. Only then higher rating and review count.
+4. Then trending: among rows that fit equally, take the hot ones (7d before 30d); include a few hot places whenever they fit, so the planner can use them.
+5. Only then higher rating and review count.
 Use only ids from the input. Output: {{"food":["f3","f12",...],"activities":["a7",...]}}
 
 {preferences_block(req, locale)}"""

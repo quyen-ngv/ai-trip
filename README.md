@@ -2,7 +2,7 @@
 
 Internal worker that turns an AI-trip job from the Java backend into a saved itinerary.
 Java owns auth, quota, the job row and SSE; this service only calls back into
-`/v1/api/internal/ai-trip-generations/{jobId}/{config|events|candidates|resolve-candidates|commit}`.
+`/v1/api/internal/ai-trip-generations/{jobId}/{config|events|candidates|trending|resolve-candidates|commit}`.
 
 It is also the AI service of the Python side: the Pengoo assistant (`app/assistant/`) and the model
 steps of social video extraction run here. Every chat / Responses call goes through `app/providers.py`

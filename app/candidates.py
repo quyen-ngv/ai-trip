@@ -153,6 +153,9 @@ def normalize(row: dict, source: str = "db") -> dict:
         "resolvedBy": row.get("resolvedBy") or None,
         "externalResolutionVerified": bool(row.get("externalResolutionVerified")),
         "isPinned": bool(row.get("isPinned")) or source == "social",
+        # OnDetour trips + check-ins at the place in the last 7 / 30 days (only `/trending` rows).
+        "hot7d": int(_num(row.get("tripsLast7Days")) or 0) + int(_num(row.get("checkinsLast7Days")) or 0),
+        "hot30d": int(_num(row.get("tripsLast30Days")) or 0) + int(_num(row.get("checkinsLast30Days")) or 0),
     }
 
 
@@ -202,6 +205,27 @@ def merge(*lists: list[dict]) -> list[dict]:
                 seen_candidates.add(candidate_id)
             out.append(r)
     return out
+
+
+def mark_trending(rows: list[dict], hot: list[dict]) -> list[dict]:
+    """Copy the 7/30-day use of each trending row onto the catalogue row of the same place, and
+    append the trending places the catalogue query did not return."""
+    by_id = {r["id"]: r for r in rows if r.get("id")}
+    extra = []
+    for h in hot:
+        row = by_id.get(h.get("id"))
+        if row is None:
+            extra.append(h)
+        else:
+            row["hot7d"], row["hot30d"] = h.get("hot7d") or 0, h.get("hot30d") or 0
+    return merge(rows, extra)
+
+
+def hot_signal(r: dict) -> dict | None:
+    """The trend as the models read it: {"7d": n, "30d": m}, or None when unused lately."""
+    if not r.get("hot30d") and not r.get("hot7d"):
+        return None
+    return {"7d": r.get("hot7d") or 0, "30d": max(r.get("hot30d") or 0, r.get("hot7d") or 0)}
 
 
 def bucket(rows: list[dict]) -> dict[str, list[dict]]:
@@ -267,6 +291,8 @@ def compact_for_select(r: dict, ref: str) -> dict:
         out["rating"] = round(r["reviewRating"], 1)
     if r.get("reviewCount"):
         out["reviews"] = r["reviewCount"]
+    if hot_signal(r):
+        out["hot"] = hot_signal(r)
     return out
 
 
@@ -315,6 +341,8 @@ def compact_for_plan(r: dict, weekdays: list[str], ref: str) -> dict:
         out["lng"] = round(r["longitude"], 4)
     if r.get("visitDurationMinutes"):
         out["visitMin"] = r["visitDurationMinutes"]
+    if hot_signal(r):
+        out["hot"] = hot_signal(r)
     if r.get("price"):
         out["price"] = r["price"]
     if r.get("tags"):

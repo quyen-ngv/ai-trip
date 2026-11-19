@@ -292,6 +292,16 @@ def test_reply_language_follows_the_question_then_the_app():
     assert reply_language("Ok", "ja") == "Japanese"
 
 
+def test_reply_language_tells_the_chinese_scripts_and_latin_app_languages_apart():
+    from app.assistant.prompts import reply_language
+    assert reply_language("Ok", "zh-CN") == "Simplified Chinese"
+    assert reply_language("Ok", "zh-Hant-HK") == "Traditional Chinese"
+    assert reply_language("还剑湖附近吃什么？", "zh-CN") == "Simplified Chinese"
+    assert reply_language("還劍湖附近吃什麼？", "zh-TW") == "Traditional Chinese"
+    assert reply_language("Où manger près de Hội An ce soir ?", "fr") == "French"
+    assert reply_language("Ok", "es-MX") == "Spanish"
+
+
 def test_trip_snapshot_is_compacted_with_ride_minutes():
     from app.assistant.prompts import compact_trip
     trip = {"startDate": [2026, 12, 19], "today": {"date": [2026, 10, 24], "startsInDays": 56},

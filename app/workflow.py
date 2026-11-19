@@ -19,7 +19,8 @@ import httpx
 from langgraph.graph import StateGraph, START, END
 from . import ai_log, config
 from .candidates import (ALL_GROUPS, FOOD, bucket, diversity_key, group_budget, normalize_group, capacity, compact_for_plan,
-                         compact_for_select, destination_dates, is_food, merge, normalize, pace_plan, quality,
+                         compact_for_select, destination_dates, is_food, mark_trending, merge, normalize, pace_plan,
+                         quality,
                          research_needs, row_key)
 from .geo import WEEKDAYS, haversine_km
 from .itinerary import (add_time_estimates, append_missing_social_items, apply_social_texts, materialize,
@@ -85,6 +86,20 @@ class JavaClient:
             r = await c.post(self.root + "/candidates", headers=self.headers, json=body)
             r.raise_for_status()
             return r.json().get("data") or []
+
+    async def trending(self, d: dict, groups: list[str]) -> list[dict]:
+        """The destination's places travellers used most in the last 7 and 30 days, as catalogue
+        rows with the counts. Extra context only: any failure gives an empty list."""
+        body = {"latitude": d["latitude"], "longitude": d["longitude"], "placeGroups": groups,
+                "locationImageId": d.get("locationImageId")}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(self.root + "/trending", headers=self.headers, json=body)
+                r.raise_for_status()
+                return r.json().get("data") or []
+        except Exception as e:
+            logger.warning("trending fetch failed, planning without it: %s", e)
+            return []
 
     async def resolve_candidates(self, d: dict, candidates: list[dict]) -> list[dict]:
         if not candidates:
@@ -363,8 +378,13 @@ async def build_workflow(job: dict[str, Any], token: str):
                            if isinstance(r, dict)]
             if d.get("latitude") is not None and d.get("longitude") is not None:
                 days = len(dest_dates[i]) or 1
-                lists = await asyncio.gather(*(java.candidates(d, [g], candidate_limit(g, pace, days)) for g in query_groups))
-                catalogue_rows = merge(*([normalize(r) for r in lst] for lst in lists))
+                lists, hot = await asyncio.gather(
+                    asyncio.gather(*(java.candidates(d, [g], candidate_limit(g, pace, days)) for g in query_groups)),
+                    java.trending(d, query_groups))
+                # Trending rows mark the catalogue rows they match and add the hot places the
+                # catalogue cut-off (overall score) left out.
+                catalogue_rows = mark_trending(merge(*([normalize(r) for r in lst] for lst in lists)),
+                                               [normalize(r) for r in hot])
             else:
                 # An unresolved social destination is still a valid input. The source rows are
                 # enough for the planner; do not call Java's coordinate-required catalogue API.
