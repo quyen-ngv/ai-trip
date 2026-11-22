@@ -7,6 +7,7 @@ the step key).
 """
 from __future__ import annotations
 
+import copy
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -160,6 +161,33 @@ DIRECT_TOOLS = [t for t in DIRECT_TOOLS if t["function"]["name"] not in _NEEDS_T
     _fn("list_expenses", "Logged expenses of one of the user's trips (ids for EDIT_EXPENSE / REMOVE_EXPENSE).",
         {"trip_id": {"type": "string"}, "query": {"type": "string"}}, ["trip_id"]),
 ]
+
+# "Near me" exists only in the 1:1 chat: the app sends the asker's device position with the
+# question and Java keeps it for that turn, so the model passes a flag and never a coordinate. A
+# trip chat does not get the parameter (its other members read the answer, which would tell them
+# where the asker is), so its tool list is unchanged.
+_NEAR_ME = {"type": "boolean",
+            "description": "true = around where the user is right now (their device's position), for 'near me / "
+                           "near here / around me / gần đây / quanh đây / gần mình'. Only when the context says "
+                           "the device position is known. It replaces city, day and activity_id as the anchor; "
+                           "distances in the result are from the user."}
+NEAR_ME_TOOLS = ("search_places", "get_weather", "search_events", "search_meetups", "get_local_dishes",
+                 "search_public_trips")
+
+
+def _with_near_me(tool: dict) -> dict:
+    if tool["function"]["name"] not in NEAR_ME_TOOLS:
+        return tool
+    tool = copy.deepcopy(tool)
+    properties = tool["function"]["parameters"]["properties"]
+    properties["near_me"] = _NEAR_ME
+    entry = (properties.get("searches") or {}).get("items", {}).get("properties")
+    if entry is not None:
+        entry["near_me"] = {"type": "boolean"}
+    return tool
+
+
+DIRECT_TOOLS = [_with_near_me(t) for t in DIRECT_TOOLS]
 
 WEB_SEARCH = _fn(
     "web_search",

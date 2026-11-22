@@ -90,7 +90,7 @@ TOOL_LIMIT_DEFAULT = 3
 BATCHES = {"get_place_details": ("place_ids", "place_id", 6), "travel_time": ("legs", None, 10),
            "search_places": ("searches", None, 6)}
 # What one entry of search_places' `searches` may set; the call's own arguments are shared by all.
-_SEARCH_KEYS = ("query", "types", "kind", "activity_id", "day", "city", "sort", "radius_km", "limit")
+_SEARCH_KEYS = ("query", "types", "kind", "activity_id", "day", "city", "near_me", "sort", "radius_km", "limit")
 REPEATED_CALL = "Same call already answered above in this conversation: use that result."
 NUDGE = ("Your last message was neither a tool call nor the final JSON, so the user would see nothing useful. "
          "If you meant to check something, call that tool now. Otherwise reply with the final JSON answer.")
@@ -897,7 +897,8 @@ def flag_thin_catalogue(result: Any, web_left: bool, args: dict | None = None) -
                if str(t) not in found_types and (str(t) in FOOD_TYPES) not in found_families]
     if missing:
         reasons.append("nothing of type " + ", ".join(missing))
-    if (args or {}).get("activity_id"):
+    # Around one exact point (a stop of the trip, or the asker with near_me) "near" means walking distance.
+    if (args or {}).get("activity_id") or (args or {}).get("near_me") is True:
         close = [row for row in rows if isinstance(row.get("distanceKm"), (int, float))
                  and row["distanceKm"] <= NEAR_STOP_KM]
         if len(close) < THIN_CATALOGUE_ROWS:

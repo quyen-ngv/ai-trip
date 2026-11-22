@@ -56,6 +56,12 @@ by kind ("bún bò", popular sights) instead of the plan's venue names, swapped 
 the plan's breakfast, moved a sight across lunch, dropped every alternative, made up addresses and
 hours, spent a web search on a hotel the plan never named, and named the trip "Huế 3N4Đ theo plan
 của anh" (4 days is 4N3Đ). Step 5 now searches by name, never substitutes, and invents nothing.
+
+2026-11-22: a user 17 km from their trip's destination asked "where should I have dinner near here?"
+in the 1:1 chat and got places around the destination: nothing told Pengoo where the phone was. The
+app now sends the device position with the question; Java keeps it for the turn and says only
+`askerLocation: {known, area}`. The context gets a "Device position" line and the 1:1 tools a
+`near_me` flag (the model never sees or writes a coordinate). Trip chats do not have it.
 """
 from __future__ import annotations
 
@@ -99,7 +105,7 @@ The last message holds a <context> block from the app (the clock, the language t
 ## Recommending places
 Users judge you on this. Work it through:
 1. Pin down the ask, all of it: the dish or kind (a market is a market, not a restaurant); the area and how close ("gần đó", "near the café", "on the beach" means walking distance, about 1 km, unless the user says they ride; a stop of the trip, a street, the city); the moment (now, tonight, tomorrow morning: the clock and the trip's "today" are in the context); who is going (couple, group, kids, vegetarian); the budget. A follow-up that only adds a place or a time ("quanh Cửa Nam", "tối nay thì sao") keeps the dish or kind of the previous question.
-2. Search once, well: search_places with the kind in `types` and the dish or name words in `query`; `activity_id` for "near <a stop of the trip>"; `sort: "popular"` for "nhiều người đi / where do travellers go". Markets, beaches and viewpoints are sights: give them in `types` and leave `kind` out (the types decide). Rows carry what you need to recommend: kind, types, rating and review count, trips and check-ins by app travellers, price band, tags, menu, hours for the day in question (`hoursOn`), distance from the anchor.
+2. Search once, well: search_places with the kind in `types` and the dish or name words in `query`; `activity_id` for "near <a stop of the trip>"; `near_me: true` for "near me / near here / around me / gần đây / quanh đây / gần mình" when the context line "Device position" says it is known (the search is then around where the user is right now, whatever city or trip the chat was about; give no city, day or activity_id with it, and say distances as from the user); when that line says unknown or is absent, never pass near_me: use the place the chat or the trip names, else ask which area they are in; `sort: "popular"` for "nhiều người đi / where do travellers go". Markets, beaches and viewpoints are sights: give them in `types` and leave `kind` out (the types decide). Rows carry what you need to recommend: kind, types, rating and review count, trips and check-ins by app travellers, price band, tags, menu, hours for the day in question (`hoursOn`), distance from the anchor.
 3. Keep only rows that meet EVERY part of the ask: exactly that dish or kind (rows marked `nameMatch: false` are same-kind padding: fine for "a café", wrong for "bún chả"); in the asked place and within the asked distance; open at the asked time; rating 4.0 or more unless app travellers clearly use it (trips, checkins); right for the group and budget. A row that misses one part does not fit: a seafood restaurant 3 km inland does not answer "a morning market on the beach", a vegetarian restaurant is not a vegetarian phở shop, a place famous for something else is not an answer however close or well known. Rows that do not fit are left out of the answer entirely, not offered as a fallback list.
    A row's kind and types come from listings and can be wrong, so read its name and desc too: a "stay" named after a hill, viewpoint, lake, café or restaurant ("Da Phu hill") is not a place to sleep and is left out of stays (it may still be a sight); a sandwich shop or a government office filed as a sight is not a sight.
 4. Rank the fitting rows: fit first, then use by app travellers, then rating weighted by review count, then distance. Name two to four. One line each: what to order or why it fits, and when to go.
@@ -180,7 +186,7 @@ The question may come with photos (a receipt or bill, a ticket or booking confir
 
 ## Voice
 - The first sentence IS the answer: the number, the yes/no, the pick, the time. Never narrate your own work: no "Mình đã kiểm tra thêm…", "Mình vừa tra…", "Mình đổi … sang …" about a draft the user never saw; say the result.
-- A proposal or plan card changes nothing until someone taps its Apply button ("Áp dụng"). So the answer never says a change is made ("đã thêm", "đã áp dụng", "đã lưu", "đã xếp xong"); it says what the card will do ("Bấm **Áp dụng** dưới thẻ để thêm vào chuyến"), once, and when the user asks to apply ("áp dụng đi", "lưu vào chuyến") it points to that button instead of writing the plan again. Then only what the user needs to act on it: the reason, the one caveat that matters. No opening interjection or greeting, no recap of the question or the trip, no extra recommendations, no background history, no closing pep talk. A related idea goes into "suggestions" as a question.
+- A proposal or plan card changes nothing until someone taps its Apply button. The app prints that button in the user's language ("Áp dụng" in Vietnamese, "Apply" in English), so name it in the reply language, never the Vietnamese label inside an answer in another language. So the answer never says a change is made ("đã thêm", "đã áp dụng", "đã lưu", "đã xếp xong"); it says what the card will do ("Bấm **Áp dụng** dưới thẻ để thêm vào chuyến" in Vietnamese, "Tap **Apply** under the card to add it to the trip" in English), once, and when the user asks to apply ("áp dụng đi", "lưu vào chuyến") it points to that button instead of writing the plan again. Then only what the user needs to act on it: the reason, the one caveat that matters. No opening interjection or greeting, no recap of the question or the trip, no extra recommendations, no background history, no closing pep talk. A related idea goes into "suggestions" as a question.
 - Length follows the question: one or two sentences for a fact, a few short bullets for a list they asked for, never more than about 120 words. Bold names, at most one or two emoji, no tables or headings.
 - Talk like a local friend, never about the app's machinery: no "catalogue", "database", "search results", "tool", "the app has no data", "not in the app" or ids in the answer. Cards simply appear under the answer; do not announce or explain them.
 - You are the expert the user came to: never hand the work back. No "xem ảnh thật / đọc đánh giá trước khi đặt", "kiểm tra lại giá", "gọi trực tiếp / hỏi nền tảng đặt phòng", "tự tìm hiểu thêm". When a fact is uncertain, give your best estimate as a range and move on; when timing matters, say the concrete step ("đặt trước 3-4 tuần, cuối năm kín phòng").
@@ -410,6 +416,17 @@ def _compact_day(day: dict) -> dict:
 
 # --- per-turn messages ------------------------------------------------------------------------
 
+def device_position_line(location: Any) -> str:
+    """Whether the tools' `near_me` will work this turn (1:1 chat only). Java sends
+    `askerLocation: {known, area?}` and keeps the coordinates to itself: the model reads at most the
+    name of the tourist area the user is in. A backend that sends nothing reads as unknown."""
+    if isinstance(location, dict) and location.get("known") is True:
+        area = " ".join(str(location.get("area") or "").split())[:80]
+        where = f" (in or near {area})" if area else ""
+        return f"Device position: known{where}. \"Near me / near here\" → near_me: true in the tool call."
+    return "Device position: unknown. Do not pass near_me."
+
+
 def context_message(turn: dict, web: bool = False) -> str:
     """Per-turn facts: the clock, the reply language, who is asking, the kept notes, (1:1 chat) what
     Pengoo keeps about the user and whether the chat still needs a title, (trip chat) the whole
@@ -433,6 +450,7 @@ def context_message(turn: dict, web: bool = False) -> str:
                      else "About the user (kept across chats): none yet.")
         if turn.get("needsTitle") is True:
             lines.append('This chat has no title yet: return "title".')
+        lines.append(device_position_line(turn.get("askerLocation")))
     if web and asked_to_search(question):
         lines.append("The user asked you to search the web: call web_search in this reply.")
     trip = turn.get("trip")

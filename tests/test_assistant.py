@@ -1050,3 +1050,125 @@ def test_a_reply_cut_off_by_the_output_limit_keeps_its_answer_text():
     cut = '{"answer": "Mình lên plan 3 ngày ở Phú Quốc.\n- **Ngày 1**: Bãi Trường", "places": [{"placeId": "e9f4'
     assert parse_final(cut) == {"answer": "Mình lên plan 3 ngày ở Phú Quốc.\n- **Ngày 1**: Bãi Trường"}
     assert parse_final('{"answer": "chưa xong') == {"answer": '{"answer": "chưa xong'}
+
+
+# --- near me (the asker's device position, 1:1 chat only) -------------------------------------
+
+def _tool(conversation_type: str, name: str) -> dict:
+    return next(t for t in tools_for(conversation_type) if t["function"]["name"] == name)
+
+
+def _search_entry(conversation_type: str) -> dict:
+    parameters = _tool(conversation_type, "search_places")["function"]["parameters"]
+    return parameters["properties"]["searches"]["items"]["properties"]
+
+
+def test_near_me_is_a_flag_of_the_anchored_tools_in_the_one_to_one_chat_only():
+    from app.assistant.tools import NEAR_ME_TOOLS
+    assert set(NEAR_ME_TOOLS) == {"search_places", "get_weather", "search_events", "search_meetups",
+                                  "get_local_dishes", "search_public_trips"}
+    for name in NEAR_ME_TOOLS:
+        direct = _tool("ASSISTANT", name)["function"]["parameters"]
+        assert direct["properties"]["near_me"]["type"] == "boolean"
+        assert "near_me" not in direct["required"]                    # optional: a call without it works as before
+        assert "near_me" not in _tool("TRIP", name)["function"]["parameters"]["properties"]
+    # Each entry of a batch search may ask for it too; the trip chat's batch may not.
+    assert _search_entry("ASSISTANT")["near_me"] == {"type": "boolean"}
+    assert "near_me" not in _search_entry("TRIP")
+    # No coordinate argument anywhere: the model passes a flag, Java holds the position.
+    for tool in tools_for("ASSISTANT", web_search=True):
+        assert not {"lat", "lng", "latitude", "longitude"} & set(tool["function"]["parameters"]["properties"])
+    # Tools without an anchor are untouched.
+    for name in ("get_place_details", "travel_time", "list_my_trips", "get_budget"):
+        assert "near_me" not in _tool("ASSISTANT", name)["function"]["parameters"]["properties"]
+
+
+def test_near_me_reaches_java_in_a_single_search_and_in_every_batch_entry():
+    assert graph_module.batch_items("search_places", {"near_me": True, "kind": "food"}) == [
+        {"near_me": True, "kind": "food"}]
+    items = graph_module.batch_items("search_places", {"near_me": True, "searches": [
+        {"kind": "food"}, {"types": ["CAFE"], "near_me": False}, {"query": "phở", "city": "Huế"}]})
+    assert items == [{"near_me": True, "kind": "food"},
+                     {"near_me": False, "types": ["CAFE"]},
+                     {"near_me": True, "query": "phở", "city": "Huế"}]
+
+
+def test_the_context_says_whether_the_device_position_is_known_and_never_where():
+    from app.assistant.prompts import context_message
+    direct = {"conversationType": "ASSISTANT", "locale": "vi", "user": {"name": "An"}, "question": "ăn tối gần đây"}
+    known = context_message({**direct, "askerLocation": {"known": True, "area": "Đức Trọng",
+                                                         "lat": 11.8, "lng": 108.3}})
+    assert "Device position: known (in or near Đức Trọng)." in known and "near_me: true" in known
+    assert "11.8" not in known and "108.3" not in known             # coordinates never reach the prompt
+    assert "Device position: known." in context_message({**direct, "askerLocation": {"known": True}})
+    unknown = "Device position: unknown. Do not pass near_me."
+    assert unknown in context_message({**direct, "askerLocation": {"known": False, "area": "Đà Lạt"}})
+    assert unknown in context_message(direct)                         # a backend that sends nothing
+    assert unknown in context_message({**direct, "askerLocation": "yes"})
+    # A trip chat never has the asker's position, whatever the payload says.
+    assert "Device position" not in context_message({**TURN, "askerLocation": {"known": True, "area": "Huế"}})
+
+
+def test_the_prompt_tells_when_to_pass_near_me():
+    from app.assistant.prompts import SYSTEM
+    assert "`near_me: true` for \"near me / near here / around me / gần đây / quanh đây / gần mình\"" in SYSTEM
+    assert "never pass near_me" in SYSTEM
+
+
+def test_a_near_me_search_with_few_places_in_walking_distance_is_thin():
+    rows = [{"id": n, "name": n, "types": ["RESTAURANT"], "distanceKm": d}
+            for n, d in (("A", 0.4), ("B", 2.6), ("C", 2.9))]
+    result = {"near": "your location", "searched": {"types": ["RESTAURANT"]}, "places": rows}
+    flagged = graph_module.flag_thin_catalogue(result, True, {"near_me": True})
+    assert flagged["coverage"] == "thin" and "within 1.5 km of your location" in flagged["note"]
+    assert "coverage" not in graph_module.flag_thin_catalogue(result, True, {"near_me": False})
+
+
+DIRECT_TURN = {
+    "turnId": "t2", "conversationId": "c2", "conversationType": "ASSISTANT", "locale": "vi",
+    "user": {"id": "u1", "name": "An"}, "trip": None, "history": [],
+    "question": "tối nay ăn gì gần đây?", "askerLocation": {"known": True, "area": "Đức Trọng"},
+    "callbackBaseUrl": "http://java", "limits": {"maxToolCalls": 3, "maxOutputTokens": 800},
+}
+
+
+@pytest.mark.asyncio
+async def test_a_near_me_search_goes_to_java_with_the_flag_and_no_coordinates():
+    java = FakeJava()
+    model = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("search_places", {"near_me": True, "kind": "food"})]},
+        {"content": json.dumps({"answer": "Thử **Bún chả cá Bà Lữ**.", "places": [{"placeId": PLACE}],
+                                "suggestions": ["Cà phê gần đây?"]}, ensure_ascii=False)},
+    )
+    graph = build_graph(DIRECT_TURN, java, model)
+    await graph.ainvoke({"messages": initial_messages(DIRECT_TURN), "tool_calls": 0})
+
+    assert java.tools == [("search_places", {"near_me": True, "kind": "food"})]
+    assert "Device position: known (in or near Đức Trọng)." in model.calls[0]["messages"][-1]["content"]
+    offered = next(t for t in model.calls[0]["tools"] if t["function"]["name"] == "search_places")
+    assert "near_me" in offered["function"]["parameters"]["properties"]
+    assert [p["placeId"] for p in java.replies[0]["places"]] == [PLACE]
+
+
+@pytest.mark.asyncio
+async def test_a_backend_without_the_position_answers_near_me_with_an_error_and_the_turn_still_replies():
+    class NoPositionJava(FakeJava):
+        async def tool(self, name, arguments):
+            self.tools.append((name, arguments))
+            return {"error": "Device location unknown: near_me cannot be used. Ask the user which area they are in, "
+                             "or search again with city or activity_id instead of near_me."}
+
+    java = NoPositionJava()
+    model = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("search_places", {"near_me": True, "kind": "food"})]},
+        {"content": json.dumps({"answer": "Bạn đang ở khu nào?", "suggestions": ["Mình ở Đà Lạt"]},
+                               ensure_ascii=False)},
+    )
+    turn = {**DIRECT_TURN, "askerLocation": {"known": False}}
+    graph = build_graph(turn, java, model)
+    await graph.ainvoke({"messages": initial_messages(turn), "tool_calls": 0})
+
+    assert java.failures == []
+    assert java.replies[0]["markdown"] == "Bạn đang ở khu nào?"
+    tool_message = next(m for m in model.calls[1]["messages"] if m.get("role") == "tool")
+    assert "Device location unknown" in tool_message["content"]
